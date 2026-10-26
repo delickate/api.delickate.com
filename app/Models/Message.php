@@ -25,6 +25,24 @@ class Message extends Model
         'read_at' => 'datetime',
     ];
 
+    public function setBodyAttribute($value): void
+    {
+        $this->attributes['body'] = $value === null ? null : encrypt($value);
+    }
+
+    public function getBodyAttribute($value): mixed
+    {
+        if ($value === null || $value === '') {
+            return $value;
+        }
+
+        try {
+            return decrypt($value);
+        } catch (\Illuminate\Contracts\Encryption\DecryptException $exception) {
+            return $value;
+        }
+    }
+
     public function conversation(): BelongsTo
     {
         return $this->belongsTo(Conversation::class);

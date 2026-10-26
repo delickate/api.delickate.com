@@ -96,6 +96,26 @@ class ChatApiTest extends TestCase
         }
     }
 
+    public function test_message_body_is_encrypt_at_rest_and_decrypt_on_response(): void
+    {
+        [$sender, $recipient, $conversation] = $this->makeConversation();
+
+        Sanctum::actingAs($sender);
+        $response = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => 'Top secret chat message',
+        ])->assertCreated()->assertJsonPath('body', 'Top secret chat message');
+
+        $message = Message::findOrFail($response->json('id'));
+
+        $this->assertNotSame('Top secret chat message', $message->getRawOriginal('body'));
+        $this->assertSame('Top secret chat message', $message->body);
+
+        Sanctum::actingAs($recipient);
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()
+            ->assertJsonPath('data.0.body', 'Top secret chat message');
+    }
+
     public function test_unrelated_user_cannot_read_a_conversation(): void
     {
         $first = User::factory()->create();
