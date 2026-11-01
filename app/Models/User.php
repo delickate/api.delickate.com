@@ -6,6 +6,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
+use Illuminate\Support\Facades\Storage;
 use Laravel\Sanctum\HasApiTokens;
 
 class User extends Authenticatable
@@ -23,7 +24,10 @@ class User extends Authenticatable
         'phone',
         'dob',
         'password',
+        'profile_picture_path',
     ];
+
+    protected $appends = ['avatar_url'];
 
     /**
      * The attributes that should be hidden for serialization.
@@ -45,4 +49,13 @@ class User extends Authenticatable
         'dob' => 'date',
         'password' => 'hashed',
     ];
+
+    public function getAvatarUrlAttribute(): ?string
+    {
+        if (! $this->profile_picture_path) {
+            return null;
+        }
+
+        return Storage::disk('public')->url($this->profile_picture_path);
+    }
 }

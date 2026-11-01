@@ -24,6 +24,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/auth/logout', [AuthController::class, 'logout']);
     Route::get('/auth/socket-identity', [AuthController::class, 'socketIdentity']);
     Route::get('/user', fn (Request $request) => $request->user());
+    Route::post('/user/profile-picture', [AuthController::class, 'updateProfilePicture']);
 
     Route::get('/friends', [FriendController::class, 'index']);
     Route::get('/friends/requests', [FriendController::class, 'requests']);

@@ -7,6 +7,7 @@ use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Validation\ValidationException;
 
 class AuthController extends Controller
@@ -71,6 +72,31 @@ class AuthController extends Controller
             'id' => $request->user()->id,
             'name' => $request->user()->name,
             'phone' => $request->user()->phone,
+            'avatar_url' => $request->user()->avatar_url,
+        ]);
+    }
+
+    public function updateProfilePicture(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'profile_picture' => ['required', 'image', 'mimes:jpg,jpeg,png,gif,webp', 'max:5120'],
+        ]);
+
+        $user = $request->user();
+        $file = $validated['profile_picture'];
+
+        if ($user->profile_picture_path) {
+            Storage::disk('public')->delete($user->profile_picture_path);
+        }
+
+        $fileName = sprintf('profile-pictures/%s/%s.%s', $user->id, md5(uniqid((string) $user->id, true)), strtolower($file->getClientOriginalExtension() ?: 'jpg'));
+        $storedPath = $file->storeAs('', $fileName, ['disk' => 'public']);
+
+        $user->update(['profile_picture_path' => $storedPath]);
+
+        return response()->json([
+            'message' => 'Profile picture updated.',
+            'user' => $this->userData($user->fresh()),
         ]);
     }
 
@@ -82,6 +108,7 @@ class AuthController extends Controller
             'phone' => $user->phone,
             'email' => $user->email,
             'dob' => $user->dob?->toDateString(),
+            'avatar_url' => $user->avatar_url,
         ];
     }
 }

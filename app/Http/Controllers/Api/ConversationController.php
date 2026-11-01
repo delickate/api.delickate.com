@@ -20,9 +20,9 @@ class ConversationController extends Controller
         $conversations = Conversation::query()
             ->where(fn ($query) => $query->where('low_user_id', $userId)->orWhere('high_user_id', $userId))
             ->with([
-                'lowUser:id,name,phone',
-                'highUser:id,name,phone',
-                'messages' => fn ($query) => $query->with('sender:id,name')->latest('id')->limit(1),
+                'lowUser:id,name,phone,profile_picture_path',
+                'highUser:id,name,phone,profile_picture_path',
+                'messages' => fn ($query) => $query->with('sender:id,name,profile_picture_path')->latest('id')->limit(1),
             ])
             ->withCount([
                 'messages as unread_count' => fn ($query) => $query
@@ -68,9 +68,9 @@ class ConversationController extends Controller
         ]);
 
         $conversation->load([
-            'lowUser:id,name,phone',
-            'highUser:id,name,phone',
-            'messages' => fn ($query) => $query->with('sender:id,name')->latest('id')->limit(1),
+            'lowUser:id,name,phone,profile_picture_path',
+            'highUser:id,name,phone,profile_picture_path',
+            'messages' => fn ($query) => $query->with('sender:id,name,profile_picture_path')->latest('id')->limit(1),
         ])->loadCount([
             'messages as unread_count' => fn ($query) => $query
                 ->where('sender_id', '!=', $userId)
@@ -107,7 +107,7 @@ class ConversationController extends Controller
         }
 
         $messages = $conversation->messages()
-            ->with('sender:id,name,phone')
+            ->with('sender:id,name,phone,profile_picture_path')
             ->orderByDesc('id')
             ->paginate(50);
         $messages->getCollection()->transform(fn (Message $message) => $this->messageData($message));
@@ -165,7 +165,7 @@ class ConversationController extends Controller
             throw $exception;
         }
 
-        $message->load('sender:id,name,phone');
+        $message->load('sender:id,name,phone,profile_picture_path');
 
         return response()->json($this->messageData($message), 201);
     }
@@ -254,6 +254,7 @@ class ConversationController extends Controller
                 'id' => $otherUser->id,
                 'name' => $otherUser->name,
                 'phone' => $otherUser->phone,
+                'avatar_url' => $otherUser->avatar_url,
             ] : null,
             'last_message' => $lastMessage ? $this->messageData($lastMessage) : null,
             'unread_count' => $conversation->unread_count ?? 0,
@@ -270,6 +271,7 @@ class ConversationController extends Controller
             'sender' => [
                 'id' => $message->sender->id,
                 'name' => $message->sender->name,
+                'avatar_url' => $message->sender->avatar_url,
             ],
             'body' => $message->body,
             'type' => $message->type,
