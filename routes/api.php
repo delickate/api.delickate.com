@@ -17,6 +17,15 @@ use Illuminate\Support\Facades\Route;
 |
 */
 
+Route::get('/', function () {
+    return response()->json([
+        'success' => true,
+        'message' => 'PITBConnect API is running.',
+        'api_base_url' => url('/api'),
+        'version' => '1.0.1',
+    ]);
+});
+
 Route::post('/auth/register', [AuthController::class, 'register'])->middleware('throttle:10,1');
 Route::post('/auth/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
 
