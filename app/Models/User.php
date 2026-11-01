@@ -25,6 +25,7 @@ class User extends Authenticatable
         'dob',
         'password',
         'profile_picture_path',
+        'profile_images',
     ];
 
     protected $appends = ['avatar_url'];
