@@ -90,6 +90,47 @@ class ChatApiTest extends TestCase
             ->assertJsonPath('data.0.body', 'Group hello everyone');
     }
 
+    public function test_group_member_can_be_removed_and_member_can_leave_the_group(): void
+    {
+        $owner = User::factory()->create(['phone' => '+15550000011']);
+        $memberOne = User::factory()->create(['phone' => '+15550000012']);
+        $memberTwo = User::factory()->create(['phone' => '+15550000013']);
+
+        foreach ([[$owner, $memberOne], [$owner, $memberTwo], [$memberOne, $memberTwo]] as [$user, $friend]) {
+            FriendRequest::create([
+                'low_user_id' => min($user->id, $friend->id),
+                'high_user_id' => max($user->id, $friend->id),
+                'sender_id' => $user->id,
+                'status' => 'accepted',
+            ]);
+        }
+
+        Sanctum::actingAs($owner);
+        $group = $this->postJson('/api/groups', [
+            'name' => 'Support group',
+            'friend_ids' => [$memberOne->id, $memberTwo->id],
+        ])->assertCreated()->json();
+
+        $this->deleteJson("/api/groups/{$group['id']}/members/{$memberOne->id}")
+            ->assertOk()
+            ->assertJsonPath('removed_user_id', $memberOne->id);
+
+        $this->assertDatabaseMissing('conversation_users', [
+            'conversation_id' => $group['id'],
+            'user_id' => $memberOne->id,
+        ]);
+
+        Sanctum::actingAs($memberTwo);
+        $this->postJson("/api/groups/{$group['id']}/leave")
+            ->assertOk()
+            ->assertJsonPath('message', 'You left the group.');
+
+        $this->assertDatabaseMissing('conversation_users', [
+            'conversation_id' => $group['id'],
+            'user_id' => $memberTwo->id,
+        ]);
+    }
+
     public function test_friends_can_accept_requests_and_send_messages_with_receipts(): void
     {
         $sender = User::factory()->create(['phone' => '+15551234567']);

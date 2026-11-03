@@ -43,6 +43,8 @@ Route::middleware('auth:sanctum')->group(function () {
 
         Route::get('/conversations', [ConversationController::class, 'index']);
     Route::post('/groups', [ConversationController::class, 'createGroup']);
+    Route::post('/groups/{conversation}/leave', [ConversationController::class, 'leaveGroup']);
+    Route::delete('/groups/{conversation}/members/{user}', [ConversationController::class, 'removeMember']);
     Route::post('/conversations', [ConversationController::class, 'store']);
     Route::get('/conversations/{conversation}/socket-access', [ConversationController::class, 'socketAccess']);
     Route::get('/conversations/{conversation}/messages', [ConversationController::class, 'messages']);

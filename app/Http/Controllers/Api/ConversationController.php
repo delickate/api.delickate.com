@@ -155,6 +155,60 @@ class ConversationController extends Controller
         return response()->json($this->conversationData($conversation, $userId), 201);
     }
 
+    public function leaveGroup(Request $request, Conversation $conversation): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+
+        if ($conversation->type !== 'group' || ! $this->userIsParticipant($conversation, $userId)) {
+            return response()->json(['message' => 'Group not found.'], 404);
+        }
+
+        if ((int) $conversation->created_by_user_id === $userId) {
+            return response()->json(['message' => 'The group creator cannot leave the group. Transfer ownership or delete the group first.'], 403);
+        }
+
+        $conversation->participants()->detach($userId);
+
+        return response()->json([
+            'message' => 'You left the group.',
+            'conversation_id' => $conversation->id,
+            'removed_user_id' => $userId,
+        ]);
+    }
+
+    public function removeMember(Request $request, Conversation $conversation, User $user): JsonResponse
+    {
+        $requestingUserId = (int) $request->user()->id;
+
+        if ($conversation->type !== 'group') {
+            return response()->json(['message' => 'Group not found.'], 404);
+        }
+
+        if (! $this->userIsParticipant($conversation, $requestingUserId)) {
+            return response()->json(['message' => 'You are not a member of this group.'], 403);
+        }
+
+        if ((int) $requestingUserId !== (int) $conversation->created_by_user_id && (int) $requestingUserId !== (int) $user->id) {
+            return response()->json(['message' => 'Only the group creator or the member themselves can remove a member.'], 403);
+        }
+
+        if ((int) $user->id === (int) $conversation->created_by_user_id) {
+            return response()->json(['message' => 'The group creator cannot be removed.'], 403);
+        }
+
+        if (! $this->userIsParticipant($conversation, (int) $user->id)) {
+            return response()->json(['message' => 'This member is not in the group.'], 404);
+        }
+
+        $conversation->participants()->detach($user->id);
+
+        return response()->json([
+            'message' => 'Member removed from group.',
+            'conversation_id' => $conversation->id,
+            'removed_user_id' => $user->id,
+        ]);
+    }
+
     public function socketAccess(Request $request, Conversation $conversation): JsonResponse
     {
         $userId = (int) $request->user()->id;
