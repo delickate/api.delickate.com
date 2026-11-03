@@ -41,7 +41,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/friends/requests/{friendRequest}/{action}', [FriendController::class, 'respond'])
         ->whereIn('action', ['accept', 'reject']);
 
-    Route::get('/conversations', [ConversationController::class, 'index']);
+        Route::get('/conversations', [ConversationController::class, 'index']);
+    Route::post('/groups', [ConversationController::class, 'createGroup']);
     Route::post('/conversations', [ConversationController::class, 'store']);
     Route::get('/conversations/{conversation}/socket-access', [ConversationController::class, 'socketAccess']);
     Route::get('/conversations/{conversation}/messages', [ConversationController::class, 'messages']);

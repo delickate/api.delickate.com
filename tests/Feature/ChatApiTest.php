@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Models\Conversation;
+use App\Models\FriendRequest;
 use App\Models\Message;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -41,6 +42,52 @@ class ChatApiTest extends TestCase
             'phone' => '+15551234567',
             'password' => 'incorrect-password',
         ])->assertUnprocessable();
+    }
+
+    public function test_group_can_be_created_and_used_for_group_chat(): void
+    {
+        $owner = User::factory()->create(['phone' => '+15550000001']);
+        $friendOne = User::factory()->create(['phone' => '+15550000002']);
+        $friendTwo = User::factory()->create(['phone' => '+15550000003']);
+
+        foreach ([[$owner, $friendOne], [$owner, $friendTwo]] as [$user, $friend]) {
+            FriendRequest::create([
+                'low_user_id' => min($user->id, $friend->id),
+                'high_user_id' => max($user->id, $friend->id),
+                'sender_id' => $user->id,
+                'status' => 'accepted',
+            ]);
+        }
+
+        Sanctum::actingAs($owner);
+        $groupResponse = $this->postJson('/api/groups', [
+            'name' => 'Launch team',
+            'friend_ids' => [$friendOne->id, $friendTwo->id],
+        ]);
+
+        $groupResponse
+            ->assertCreated()
+            ->assertJsonPath('type', 'group')
+            ->assertJsonPath('name', 'Launch team')
+            ->assertJsonCount(3, 'participants');
+
+        $conversationId = $groupResponse->json('id');
+
+        $this->getJson('/api/conversations')
+            ->assertOk()
+            ->assertJsonPath('data.0.type', 'group')
+            ->assertJsonPath('data.0.name', 'Launch team');
+
+        $messageResponse = $this->postJson("/api/conversations/{$conversationId}/messages", [
+            'body' => 'Group hello everyone',
+        ]);
+
+        $messageResponse->assertCreated()->assertJsonPath('body', 'Group hello everyone');
+
+        Sanctum::actingAs($friendTwo);
+        $this->getJson("/api/conversations/{$conversationId}/messages")
+            ->assertOk()
+            ->assertJsonPath('data.0.body', 'Group hello everyone');
     }
 
     public function test_friends_can_accept_requests_and_send_messages_with_receipts(): void
@@ -179,11 +226,11 @@ class ChatApiTest extends TestCase
         [$sender, , $conversation] = $this->makeConversation();
         Sanctum::actingAs($sender);
 
-        $this->post("/api/conversations/{$conversation->id}/messages", [
+        $this->postJson("/api/conversations/{$conversation->id}/messages", [
             'attachment' => UploadedFile::fake()->create('oversized.pdf', 5121, 'application/pdf'),
         ])->assertUnprocessable()->assertJsonValidationErrors('attachment');
 
-        $this->post("/api/conversations/{$conversation->id}/messages", [
+        $this->postJson("/api/conversations/{$conversation->id}/messages", [
             'attachment' => UploadedFile::fake()->createWithContent('fake.jpg', 'not a real jpeg'),
         ])->assertUnprocessable()->assertJsonValidationErrors('attachment');
     }

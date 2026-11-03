@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Conversation;
 use App\Models\FriendRequest;
 use App\Models\Message;
+use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -18,10 +19,16 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
         $conversations = Conversation::query()
-            ->where(fn ($query) => $query->where('low_user_id', $userId)->orWhere('high_user_id', $userId))
+            ->where(function ($query) use ($userId) {
+                $query->where(function ($innerQuery) use ($userId) {
+                    $innerQuery->where('low_user_id', $userId)
+                        ->orWhere('high_user_id', $userId);
+                })->orWhereHas('participants', fn ($participantQuery) => $participantQuery->where('users.id', $userId));
+            })
             ->with([
                 'lowUser:id,name,phone,profile_picture_path',
                 'highUser:id,name,phone,profile_picture_path',
+                'participants:id,name,phone,profile_picture_path',
                 'messages' => fn ($query) => $query->with('sender:id,name,profile_picture_path')->latest('id')->limit(1),
             ])
             ->withCount([
@@ -65,11 +72,79 @@ class ConversationController extends Controller
         $conversation = Conversation::firstOrCreate([
             'low_user_id' => $lowId,
             'high_user_id' => $highId,
+        ], [
+            'type' => 'direct',
         ]);
 
         $conversation->load([
             'lowUser:id,name,phone,profile_picture_path',
             'highUser:id,name,phone,profile_picture_path',
+            'participants:id,name,phone,profile_picture_path',
+            'messages' => fn ($query) => $query->with('sender:id,name,profile_picture_path')->latest('id')->limit(1),
+        ])->loadCount([
+            'messages as unread_count' => fn ($query) => $query
+                ->where('sender_id', '!=', $userId)
+                ->whereNull('read_at'),
+        ]);
+
+        return response()->json($this->conversationData($conversation, $userId), 201);
+    }
+
+    public function createGroup(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'name' => ['required', 'string', 'min:1', 'max:100'],
+            'friend_ids' => ['required', 'array', 'min:1'],
+            'friend_ids.*' => ['integer', 'exists:users,id'],
+        ]);
+
+        $userId = (int) $request->user()->id;
+        $friendIds = array_values(array_unique(array_map('intval', $validated['friend_ids'])));
+        $friendIds = array_values(array_filter($friendIds, fn (int $friendId) => $friendId !== $userId));
+
+        if ($friendIds === []) {
+            throw ValidationException::withMessages([
+                'friend_ids' => ['Choose at least one friend to add to the group.'],
+            ]);
+        }
+
+        $acceptedFriendIds = FriendRequest::query()
+            ->where('status', 'accepted')
+            ->where(function ($query) use ($userId) {
+                $query->where('low_user_id', $userId)
+                    ->orWhere('high_user_id', $userId);
+            })
+            ->get()
+            ->flatMap(fn (FriendRequest $friendRequest) => [
+                (int) $friendRequest->low_user_id,
+                (int) $friendRequest->high_user_id,
+            ])
+            ->unique()
+            ->reject(fn (int $memberId) => $memberId === $userId)
+            ->values()
+            ->all();
+
+        $invalidFriendIds = array_values(array_diff($friendIds, $acceptedFriendIds));
+        if ($invalidFriendIds !== []) {
+            return response()->json([
+                'message' => 'Only accepted friends can be added to a group.',
+            ], 403);
+        }
+
+        $conversation = DB::transaction(function () use ($userId, $friendIds, $validated) {
+            $conversation = Conversation::create([
+                'type' => 'group',
+                'name' => trim($validated['name']),
+                'created_by_user_id' => $userId,
+            ]);
+
+            $conversation->participants()->syncWithoutDetaching(array_values(array_unique(array_merge([$userId], $friendIds))));
+
+            return $conversation->fresh(['participants:id,name,phone,profile_picture_path']);
+        });
+
+        $conversation->load([
+            'participants:id,name,phone,profile_picture_path',
             'messages' => fn ($query) => $query->with('sender:id,name,profile_picture_path')->latest('id')->limit(1),
         ])->loadCount([
             'messages as unread_count' => fn ($query) => $query
@@ -84,8 +159,15 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
 
-        if (! in_array($userId, [(int) $conversation->low_user_id, (int) $conversation->high_user_id], true)) {
+        if (! $this->userIsParticipant($conversation, $userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
+        }
+
+        if ($conversation->type === 'group') {
+            return response()->json([
+                'conversation_id' => $conversation->id,
+                'peer_id' => null,
+            ]);
         }
 
         $peerId = $userId === (int) $conversation->low_user_id
@@ -102,7 +184,7 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
 
-        if (! in_array($userId, [(int) $conversation->low_user_id, (int) $conversation->high_user_id], true)) {
+        if (! $this->userIsParticipant($conversation, $userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
         }
 
@@ -119,7 +201,7 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
 
-        if (! in_array($userId, [(int) $conversation->low_user_id, (int) $conversation->high_user_id], true)) {
+        if (! $this->userIsParticipant($conversation, $userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
         }
 
@@ -174,7 +256,7 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
 
-        if (! in_array($userId, [(int) $conversation->low_user_id, (int) $conversation->high_user_id], true)
+        if (! $this->userIsParticipant($conversation, $userId)
             || (int) $message->conversation_id !== (int) $conversation->id
             || ! $message->attachment_path) {
             return response()->json(['message' => 'Attachment not found.'], 404);
@@ -204,7 +286,7 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
 
-        if (! in_array($userId, [(int) $conversation->low_user_id, (int) $conversation->high_user_id], true)) {
+        if (! $this->userIsParticipant($conversation, $userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
         }
 
@@ -243,24 +325,32 @@ class ConversationController extends Controller
 
     private function conversationData(Conversation $conversation, int $userId): array
     {
-        $otherUser = (int) $conversation->low_user_id === $userId
-            ? $conversation->highUser
-            : $conversation->lowUser;
+        $conversationType = $conversation->type ?? 'direct';
+        $otherUser = $conversationType === 'group'
+            ? null
+            : ((int) $conversation->low_user_id === $userId ? $conversation->highUser : $conversation->lowUser);
         $lastMessage = $conversation->messages->first();
 
-        return [
+        $payload = [
             'id' => $conversation->id,
-            'friend' => $otherUser ? [
-                'id' => $otherUser->id,
-                'name' => $otherUser->name,
-                'phone' => $otherUser->phone,
-                'avatar_url' => $otherUser->avatar_url,
-            ] : null,
+            'type' => $conversationType,
+            'friend' => $otherUser ? $this->publicUser($otherUser) : null,
             'last_message' => $lastMessage ? $this->messageData($lastMessage) : null,
             'unread_count' => $conversation->unread_count ?? 0,
             'created_at' => $conversation->created_at,
             'updated_at' => $conversation->updated_at,
         ];
+
+        if ($conversationType === 'group') {
+            $payload['name'] = $conversation->name;
+            $payload['participants'] = $conversation->participants
+                ->map(fn (User $user) => $this->publicUser($user))
+                ->values()
+                ->all();
+            $payload['created_by_user_id'] = $conversation->created_by_user_id;
+        }
+
+        return $payload;
     }
 
     private function messageData(Message $message): array
@@ -283,6 +373,29 @@ class ConversationController extends Controller
             'created_at' => $message->created_at,
             'delivered_at' => $message->delivered_at,
             'read_at' => $message->read_at,
+        ];
+    }
+
+    private function userIsParticipant(Conversation $conversation, int $userId): bool
+    {
+        if (in_array($userId, [(int) $conversation->low_user_id, (int) $conversation->high_user_id], true)) {
+            return true;
+        }
+
+        return $conversation->participants()->whereKey($userId)->exists();
+    }
+
+    private function publicUser(?User $user): ?array
+    {
+        if (! $user) {
+            return null;
+        }
+
+        return [
+            'id' => $user->id,
+            'name' => $user->name,
+            'phone' => $user->phone,
+            'avatar_url' => $user->avatar_url,
         ];
     }
 
