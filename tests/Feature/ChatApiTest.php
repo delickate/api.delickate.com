@@ -131,6 +131,36 @@ class ChatApiTest extends TestCase
         ]);
     }
 
+    public function test_users_can_unfriend_each_other_and_clear_their_direct_conversation(): void
+    {
+        $first = User::factory()->create(['phone' => '+15550000021']);
+        $second = User::factory()->create(['phone' => '+15550000022']);
+
+        FriendRequest::create([
+            'low_user_id' => min($first->id, $second->id),
+            'high_user_id' => max($first->id, $second->id),
+            'sender_id' => $first->id,
+            'status' => 'accepted',
+        ]);
+
+        $conversation = Conversation::create([
+            'low_user_id' => min($first->id, $second->id),
+            'high_user_id' => max($first->id, $second->id),
+            'type' => 'direct',
+        ]);
+
+        Sanctum::actingAs($first);
+        $this->deleteJson("/api/friends/{$second->id}")
+            ->assertOk()
+            ->assertJsonPath('user_id', $second->id);
+
+        $this->assertDatabaseMissing('friend_requests', [
+            'low_user_id' => min($first->id, $second->id),
+            'high_user_id' => max($first->id, $second->id),
+        ]);
+        $this->assertDatabaseMissing('conversations', ['id' => $conversation->id]);
+    }
+
     public function test_friends_can_accept_requests_and_send_messages_with_receipts(): void
     {
         $sender = User::factory()->create(['phone' => '+15551234567']);

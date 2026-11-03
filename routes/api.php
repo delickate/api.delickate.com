@@ -36,12 +36,13 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/user/profile-picture', [AuthController::class, 'updateProfilePicture']);
 
     Route::get('/friends', [FriendController::class, 'index']);
+    Route::delete('/friends/{user}', [FriendController::class, 'destroy']);
     Route::get('/friends/requests', [FriendController::class, 'requests']);
     Route::post('/friends/requests', [FriendController::class, 'storeRequest']);
     Route::post('/friends/requests/{friendRequest}/{action}', [FriendController::class, 'respond'])
         ->whereIn('action', ['accept', 'reject']);
 
-        Route::get('/conversations', [ConversationController::class, 'index']);
+    Route::get('/conversations', [ConversationController::class, 'index']);
     Route::post('/groups', [ConversationController::class, 'createGroup']);
     Route::post('/groups/{conversation}/leave', [ConversationController::class, 'leaveGroup']);
     Route::delete('/groups/{conversation}/members/{user}', [ConversationController::class, 'removeMember']);

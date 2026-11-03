@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\Conversation;
 use App\Models\FriendRequest;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
@@ -151,6 +152,43 @@ class FriendController extends Controller
         return response()->json([
             'id' => $friendRequest->id,
             'status' => $friendRequest->status,
+        ]);
+    }
+
+    public function destroy(Request $request, User $user): JsonResponse
+    {
+        $requestingUserId = (int) $request->user()->id;
+
+        if ($requestingUserId === (int) $user->id) {
+            return response()->json(['message' => 'You cannot unfriend yourself.'], 403);
+        }
+
+        $lowId = min($requestingUserId, (int) $user->id);
+        $highId = max($requestingUserId, (int) $user->id);
+
+        $friendRequest = FriendRequest::query()
+            ->where('low_user_id', $lowId)
+            ->where('high_user_id', $highId)
+            ->where('status', 'accepted')
+            ->first();
+
+        if (! $friendRequest) {
+            return response()->json(['message' => 'This user is not in your friends list.'], 404);
+        }
+
+        DB::transaction(function () use ($lowId, $highId, $friendRequest) {
+            $friendRequest->delete();
+
+            Conversation::query()
+                ->where('type', 'direct')
+                ->where('low_user_id', $lowId)
+                ->where('high_user_id', $highId)
+                ->delete();
+        });
+
+        return response()->json([
+            'message' => 'Friend removed.',
+            'user_id' => $user->id,
         ]);
     }
 
