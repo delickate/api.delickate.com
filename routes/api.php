@@ -46,6 +46,7 @@ Route::middleware('auth:sanctum')->group(function () {
 
     Route::get('/conversations', [ConversationController::class, 'index']);
     Route::post('/groups', [ConversationController::class, 'createGroup']);
+    Route::post('/groups/{conversation}/members', [ConversationController::class, 'addMember']);
     Route::post('/groups/{conversation}/leave', [ConversationController::class, 'leaveGroup']);
     Route::delete('/groups/{conversation}/members/{user}', [ConversationController::class, 'removeMember']);
     Route::post('/conversations', [ConversationController::class, 'store']);

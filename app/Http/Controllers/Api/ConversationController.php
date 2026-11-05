@@ -155,6 +155,50 @@ class ConversationController extends Controller
         return response()->json($this->conversationData($conversation, $userId), 201);
     }
 
+    public function addMember(Request $request, Conversation $conversation): JsonResponse
+    {
+        $validated = $request->validate([
+            'user_id' => ['required', 'integer', 'exists:users,id'],
+        ]);
+        $creatorId = (int) $request->user()->id;
+        $memberId = (int) $validated['user_id'];
+
+        if ($conversation->type !== 'group' || (int) $conversation->created_by_user_id !== $creatorId) {
+            return response()->json(['message' => 'Only the group creator can add members.'], 403);
+        }
+        if (! $this->userIsParticipant($conversation, $creatorId)) {
+            return response()->json(['message' => 'You are not a member of this group.'], 403);
+        }
+        if ($memberId === $creatorId) {
+            throw ValidationException::withMessages([
+                'user_id' => ['You are already a member of this group.'],
+            ]);
+        }
+        if ($this->userIsParticipant($conversation, $memberId)) {
+            return response()->json(['message' => 'This user is already a member of the group.'], 409);
+        }
+
+        $isAcceptedFriend = FriendRequest::query()
+            ->where('status', 'accepted')
+            ->where(function ($query) use ($creatorId, $memberId) {
+                $query->where('low_user_id', min($creatorId, $memberId))
+                    ->where('high_user_id', max($creatorId, $memberId));
+            })
+            ->exists();
+        if (! $isAcceptedFriend) {
+            return response()->json(['message' => 'Only accepted friends can be added to a group.'], 403);
+        }
+
+        $conversation->participants()->syncWithoutDetaching([$memberId]);
+        $member = User::query()->select(['id', 'name', 'phone', 'profile_picture_path'])->findOrFail($memberId);
+
+        return response()->json([
+            'message' => 'Member added to group.',
+            'conversation_id' => $conversation->id,
+            'member' => $this->publicUser($member),
+        ], 201);
+    }
+
     public function leaveGroup(Request $request, Conversation $conversation): JsonResponse
     {
         $userId = (int) $request->user()->id;

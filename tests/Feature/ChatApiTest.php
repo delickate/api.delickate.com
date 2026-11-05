@@ -121,8 +121,9 @@ class ChatApiTest extends TestCase
         $owner = User::factory()->create(['phone' => '+15550000011']);
         $memberOne = User::factory()->create(['phone' => '+15550000012']);
         $memberTwo = User::factory()->create(['phone' => '+15550000013']);
+        $memberThree = User::factory()->create(['phone' => '+15550000014']);
 
-        foreach ([[$owner, $memberOne], [$owner, $memberTwo], [$memberOne, $memberTwo]] as [$user, $friend]) {
+        foreach ([[$owner, $memberOne], [$owner, $memberTwo], [$owner, $memberThree], [$memberOne, $memberTwo]] as [$user, $friend]) {
             FriendRequest::create([
                 'low_user_id' => min($user->id, $friend->id),
                 'high_user_id' => max($user->id, $friend->id),
@@ -142,6 +143,8 @@ class ChatApiTest extends TestCase
             ->assertForbidden();
         $this->deleteJson("/api/groups/{$group['id']}/members/{$memberTwo->id}")
             ->assertForbidden();
+        $this->postJson("/api/groups/{$group['id']}/members", ['user_id' => $memberThree->id])
+            ->assertForbidden();
         $this->postJson("/api/groups/{$group['id']}/leave")
             ->assertOk()
             ->assertJsonPath('message', 'You left the group.');
@@ -159,10 +162,19 @@ class ChatApiTest extends TestCase
         $this->deleteJson("/api/groups/{$group['id']}/members/{$memberOne->id}")
             ->assertOk()
             ->assertJsonPath('removed_user_id', $memberOne->id);
+        $this->postJson("/api/groups/{$group['id']}/members", ['user_id' => $memberThree->id])
+            ->assertCreated()
+            ->assertJsonPath('member.id', $memberThree->id);
+        $this->postJson("/api/groups/{$group['id']}/members", ['user_id' => $memberThree->id])
+            ->assertConflict();
 
         $this->assertDatabaseMissing('conversation_users', [
             'conversation_id' => $group['id'],
             'user_id' => $memberOne->id,
+        ]);
+        $this->assertDatabaseHas('conversation_users', [
+            'conversation_id' => $group['id'],
+            'user_id' => $memberThree->id,
         ]);
 
         Sanctum::actingAs($memberOne);

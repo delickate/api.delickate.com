@@ -58,6 +58,8 @@ token. Include it on protected requests as `Authorization: Bearer YOUR_SANCTUM_T
 ### Group management
 
 - `POST /api/groups` — create a titled group with accepted friends.
+- `POST /api/groups/{id}/members` — the creator can add an accepted friend
+  using `user_id`.
 - `DELETE /api/groups/{id}/members/{user}` — only the group creator can remove
   another participant; the creator cannot remove themselves.
 - `POST /api/groups/{id}/leave` — a non-creator participant may leave; the
