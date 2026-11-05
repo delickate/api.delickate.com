@@ -29,12 +29,22 @@ class ConversationController extends Controller
                 'lowUser:id,name,phone,profile_picture_path',
                 'highUser:id,name,phone,profile_picture_path',
                 'participants:id,name,phone,profile_picture_path',
-                'messages' => fn ($query) => $query->with('sender:id,name,profile_picture_path')->latest('id')->limit(1),
+                'messages' => fn ($query) => $query
+                    ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId))
+                    ->with([
+                        'sender:id,name,profile_picture_path',
+                        'replyTo.sender:id,name,profile_picture_path',
+                        'replyTo.hiddenFromUsers' => fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId),
+                    ])
+                    ->latest('id')
+                    ->limit(1),
             ])
             ->withCount([
                 'messages as unread_count' => fn ($query) => $query
                     ->where('sender_id', '!=', $userId)
-                    ->whereNull('read_at'),
+                    ->whereNull('read_at')
+                    ->whereNull('deleted_for_everyone_at')
+                    ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId)),
             ])
             ->orderByDesc('updated_at')
             ->paginate(50);
@@ -80,11 +90,21 @@ class ConversationController extends Controller
             'lowUser:id,name,phone,profile_picture_path',
             'highUser:id,name,phone,profile_picture_path',
             'participants:id,name,phone,profile_picture_path',
-            'messages' => fn ($query) => $query->with('sender:id,name,profile_picture_path')->latest('id')->limit(1),
+            'messages' => fn ($query) => $query
+                ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId))
+                ->with([
+                    'sender:id,name,profile_picture_path',
+                    'replyTo.sender:id,name,profile_picture_path',
+                    'replyTo.hiddenFromUsers' => fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId),
+                ])
+                ->latest('id')
+                ->limit(1),
         ])->loadCount([
             'messages as unread_count' => fn ($query) => $query
                 ->where('sender_id', '!=', $userId)
-                ->whereNull('read_at'),
+                ->whereNull('read_at')
+                ->whereNull('deleted_for_everyone_at')
+                ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId)),
         ]);
 
         return response()->json($this->conversationData($conversation, $userId), 201);
@@ -145,11 +165,21 @@ class ConversationController extends Controller
 
         $conversation->load([
             'participants:id,name,phone,profile_picture_path',
-            'messages' => fn ($query) => $query->with('sender:id,name,profile_picture_path')->latest('id')->limit(1),
+            'messages' => fn ($query) => $query
+                ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId))
+                ->with([
+                    'sender:id,name,profile_picture_path',
+                    'replyTo.sender:id,name,profile_picture_path',
+                    'replyTo.hiddenFromUsers' => fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId),
+                ])
+                ->latest('id')
+                ->limit(1),
         ])->loadCount([
             'messages as unread_count' => fn ($query) => $query
                 ->where('sender_id', '!=', $userId)
-                ->whereNull('read_at'),
+                ->whereNull('read_at')
+                ->whereNull('deleted_for_everyone_at')
+                ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId)),
         ]);
 
         return response()->json($this->conversationData($conversation, $userId), 201);
@@ -287,10 +317,15 @@ class ConversationController extends Controller
         }
 
         $messages = $conversation->messages()
-            ->with('sender:id,name,phone,profile_picture_path')
+            ->whereDoesntHave('hiddenFromUsers', fn ($query) => $query->where('users.id', $userId))
+            ->with([
+                'sender:id,name,phone,profile_picture_path',
+                'replyTo.sender:id,name,profile_picture_path',
+                'replyTo.hiddenFromUsers' => fn ($query) => $query->where('users.id', $userId),
+            ])
             ->orderByDesc('id')
             ->paginate(50);
-        $messages->getCollection()->transform(fn (Message $message) => $this->messageData($message));
+        $messages->getCollection()->transform(fn (Message $message) => $this->messageData($message, $userId));
 
         return response()->json($messages);
     }
@@ -307,16 +342,24 @@ class ConversationController extends Controller
             'body' => ['required_without:attachment', 'nullable', 'string', 'max:10000'],
             'attachment' => ['required_without:body', 'nullable', 'file', 'max:5120', 'mimes:jpg,jpeg,png,gif,webp,pdf,txt'],
             'type' => ['sometimes', 'in:text'],
+            'reply_to_message_id' => ['sometimes', 'nullable', 'integer', 'exists:messages,id'],
         ]);
+        $replyToId = $validated['reply_to_message_id'] ?? null;
+        if ($replyToId !== null && (int) Message::query()->whereKey($replyToId)->value('conversation_id') !== (int) $conversation->id) {
+            throw ValidationException::withMessages([
+                'reply_to_message_id' => ['The replied-to message must belong to this conversation.'],
+            ]);
+        }
 
         $file = $request->file('attachment');
         $attachment = $file ? $this->validatedAttachment($file) : null;
         $storedPath = null;
 
         try {
-            $message = DB::transaction(function () use ($conversation, $userId, $validated, $file, $attachment, &$storedPath) {
+            $message = DB::transaction(function () use ($conversation, $userId, $validated, $file, $attachment, $replyToId, &$storedPath) {
                 $message = $conversation->messages()->create([
                     'sender_id' => $userId,
+                    'reply_to_message_id' => $replyToId,
                     'body' => $validated['body'] ?? null,
                     'type' => $file ? 'file' : 'text',
                     'attachment_name' => $attachment['name'] ?? null,
@@ -345,9 +388,60 @@ class ConversationController extends Controller
             throw $exception;
         }
 
-        $message->load('sender:id,name,phone,profile_picture_path');
+        $message->load([
+            'sender:id,name,phone,profile_picture_path',
+            'replyTo.sender:id,name,profile_picture_path',
+            'replyTo.hiddenFromUsers' => fn ($query) => $query->where('users.id', $userId),
+        ]);
 
-        return response()->json($this->messageData($message), 201);
+        return response()->json($this->messageData($message, $userId), 201);
+    }
+
+    public function deleteMessage(Request $request, Conversation $conversation, Message $message): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        if (! $this->userIsParticipant($conversation, $userId)
+            || (int) $message->conversation_id !== (int) $conversation->id) {
+            return response()->json(['message' => 'Message not found.'], 404);
+        }
+
+        $validated = $request->validate([
+            'scope' => ['required', 'in:me,everyone'],
+        ]);
+
+        if ($validated['scope'] === 'me') {
+            $message->hiddenFromUsers()->syncWithoutDetaching([$userId]);
+
+            return response()->json(['message' => 'Message deleted for you.']);
+        }
+
+        if ((int) $message->sender_id !== $userId) {
+            return response()->json(['message' => 'You can only delete your own messages for everyone.'], 403);
+        }
+
+        if ($message->deleted_for_everyone_at) {
+            return response()->json(['message' => 'Message was already deleted for everyone.']);
+        }
+
+        $attachmentPath = $message->attachment_path;
+        DB::transaction(function () use ($message) {
+            $message->forceFill([
+                'body' => null,
+                'attachment_path' => null,
+                'attachment_name' => null,
+                'attachment_mime' => null,
+                'attachment_size' => null,
+                'deleted_for_everyone_at' => now(),
+            ])->save();
+        });
+
+        if ($attachmentPath && ! Storage::disk('private')->delete($attachmentPath)) {
+            return response()->json([
+                'message' => 'The message was deleted, but its attachment could not be removed from storage.',
+            ], 500);
+        }
+
+        return response()->json(['message' => 'Message deleted for everyone.']);
     }
 
     public function downloadAttachment(Request $request, Conversation $conversation, Message $message)
@@ -433,7 +527,7 @@ class ConversationController extends Controller
             'id' => $conversation->id,
             'type' => $conversationType,
             'friend' => $otherUser ? $this->publicUser($otherUser) : null,
-            'last_message' => $lastMessage ? $this->messageData($lastMessage) : null,
+            'last_message' => $lastMessage ? $this->messageData($lastMessage, $userId) : null,
             'unread_count' => $conversation->unread_count ?? 0,
             'created_at' => $conversation->created_at,
             'updated_at' => $conversation->updated_at,
@@ -452,8 +546,14 @@ class ConversationController extends Controller
         return $payload;
     }
 
-    private function messageData(Message $message): array
+    private function messageData(Message $message, ?int $userId = null): array
     {
+        $reply = $message->replyTo;
+        $replyIsHidden = $reply
+            && $userId !== null
+            && $reply->relationLoaded('hiddenFromUsers')
+            && $reply->hiddenFromUsers->isNotEmpty();
+
         return [
             'id' => $message->id,
             'conversation_id' => $message->conversation_id,
@@ -464,6 +564,23 @@ class ConversationController extends Controller
             ],
             'body' => $message->body,
             'type' => $message->type,
+            'reply_to' => $reply
+                ? ($replyIsHidden ? [
+                    'id' => $reply->id,
+                    'unavailable' => true,
+                ] : [
+                    'id' => $reply->id,
+                    'sender' => [
+                        'id' => $reply->sender->id,
+                        'name' => $reply->sender->name,
+                    ],
+                    'body' => $reply->body,
+                    'attachment' => $reply->attachment_path ? ['name' => $reply->attachment_name] : null,
+                    'deleted_for_everyone_at' => $reply->deleted_for_everyone_at,
+                    'unavailable' => false,
+                ])
+                : null,
+            'deleted_for_everyone_at' => $message->deleted_for_everyone_at,
             'attachment' => $message->attachment_path ? [
                 'name' => $message->attachment_name,
                 'mime' => $message->attachment_mime,

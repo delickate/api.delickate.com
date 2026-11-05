@@ -285,6 +285,114 @@ class ChatApiTest extends TestCase
             ->assertJsonPath('data.0.body', 'Top secret chat message');
     }
 
+    public function test_messages_can_reply_only_to_messages_in_the_same_conversation(): void
+    {
+        [$sender, $recipient, $conversation] = $this->makeConversation();
+        $otherUser = User::factory()->create();
+        $otherConversation = Conversation::create([
+            'low_user_id' => min($sender->id, $otherUser->id),
+            'high_user_id' => max($sender->id, $otherUser->id),
+        ]);
+        Sanctum::actingAs($sender);
+
+        $originalId = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => 'Original message',
+        ])->assertCreated()->json('id');
+
+        $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => 'A reply',
+            'reply_to_message_id' => $originalId,
+        ])->assertCreated()
+            ->assertJsonPath('body', 'A reply')
+            ->assertJsonPath('reply_to.id', $originalId)
+            ->assertJsonPath('reply_to.body', 'Original message')
+            ->assertJsonPath('reply_to.sender.id', $sender->id);
+
+        $this->postJson("/api/conversations/{$otherConversation->id}/messages", [
+            'body' => 'Invalid cross-conversation reply',
+            'reply_to_message_id' => $originalId,
+        ])->assertUnprocessable()->assertJsonValidationErrors('reply_to_message_id');
+    }
+
+    public function test_messages_can_be_deleted_for_me_or_everyone_with_sender_authorization(): void
+    {
+        Storage::fake('private');
+        [$sender, $recipient, $conversation] = $this->makeConversation();
+        Sanctum::actingAs($sender);
+        $messageId = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => 'Keep this private',
+        ])->assertCreated()->json('id');
+
+        Sanctum::actingAs($recipient);
+        $this->deleteJson("/api/conversations/{$conversation->id}/messages/{$messageId}", [
+            'scope' => 'everyone',
+        ])->assertForbidden();
+        $this->deleteJson("/api/conversations/{$conversation->id}/messages/{$messageId}", [
+            'scope' => 'me',
+        ])->assertOk();
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()
+            ->assertJsonCount(0, 'data');
+        $this->getJson('/api/conversations')
+            ->assertOk()
+            ->assertJsonPath('data.0.unread_count', 0);
+
+        Sanctum::actingAs($sender);
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()
+            ->assertJsonPath('data.0.id', $messageId)
+            ->assertJsonPath('data.0.body', 'Keep this private');
+        $this->deleteJson("/api/conversations/{$conversation->id}/messages/{$messageId}", [
+            'scope' => 'everyone',
+        ])->assertOk();
+
+        Sanctum::actingAs($recipient);
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()
+            ->assertJsonPath('data', []);
+
+        Sanctum::actingAs($sender);
+        $secondMessageId = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => 'Visible to everyone before deletion',
+        ])->assertCreated()->json('id');
+        $this->deleteJson("/api/conversations/{$conversation->id}/messages/{$secondMessageId}", [
+            'scope' => 'everyone',
+        ])->assertOk();
+
+        Sanctum::actingAs($recipient);
+        $deletedResponse = $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()
+            ->assertJsonPath('data.0.id', $secondMessageId)
+            ->assertJsonPath('data.0.body', null);
+        $this->assertNotEmpty($deletedResponse->json('data.0.deleted_for_everyone_at'));
+    }
+
+    public function test_deleting_a_message_for_everyone_removes_its_private_attachment(): void
+    {
+        Storage::fake('private');
+        [$sender, , $conversation] = $this->makeConversation();
+        $path = "messages/{$conversation->id}/attachment.pdf";
+        Storage::disk('private')->put($path, "%PDF-1.4\nAttachment\n%%EOF");
+        $message = $conversation->messages()->create([
+            'sender_id' => $sender->id,
+            'body' => null,
+            'type' => 'file',
+            'attachment_path' => $path,
+            'attachment_name' => 'attachment.pdf',
+            'attachment_mime' => 'application/pdf',
+            'attachment_size' => 28,
+        ]);
+        Sanctum::actingAs($sender);
+
+        $this->deleteJson("/api/conversations/{$conversation->id}/messages/{$message->id}", [
+            'scope' => 'everyone',
+        ])->assertOk();
+
+        Storage::disk('private')->assertMissing($path);
+        $this->assertNotNull($message->fresh()->deleted_for_everyone_at);
+        $this->assertNull($message->fresh()->attachment_path);
+    }
+
     public function test_unrelated_user_cannot_read_a_conversation(): void
     {
         $first = User::factory()->create();

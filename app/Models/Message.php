@@ -4,12 +4,14 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 
 class Message extends Model
 {
     protected $fillable = [
         'conversation_id',
         'sender_id',
+        'reply_to_message_id',
         'body',
         'type',
         'attachment_path',
@@ -18,11 +20,13 @@ class Message extends Model
         'attachment_size',
         'delivered_at',
         'read_at',
+        'deleted_for_everyone_at',
     ];
 
     protected $casts = [
         'delivered_at' => 'datetime',
         'read_at' => 'datetime',
+        'deleted_for_everyone_at' => 'datetime',
     ];
 
     public function setBodyAttribute($value): void
@@ -51,5 +55,15 @@ class Message extends Model
     public function sender(): BelongsTo
     {
         return $this->belongsTo(User::class, 'sender_id');
+    }
+
+    public function replyTo(): BelongsTo
+    {
+        return $this->belongsTo(self::class, 'reply_to_message_id');
+    }
+
+    public function hiddenFromUsers(): BelongsToMany
+    {
+        return $this->belongsToMany(User::class, 'message_user_deletions');
     }
 }

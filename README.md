@@ -45,6 +45,11 @@ token. Include it on protected requests as `Authorization: Bearer YOUR_SANCTUM_T
   `attachment` multipart upload. Send text, an attachment, or both. Attachments
   are limited to 5 MiB and allow JPEG, PNG, GIF, WebP, PDF, and UTF-8 plain
   text only; extension, detected MIME type, and file signature are checked.
+- Include `reply_to_message_id` when sending to reply to a message in that
+  conversation.
+- `DELETE /api/conversations/{id}/messages/{message}` — request body `scope` is
+  `me` to hide the message only for the current participant, or `everyone` to
+  delete the sender's own message for all participants.
 - `GET /api/conversations/{id}/messages/{message}/attachment` — download an
   attachment as an authenticated conversation participant.
 - `POST /api/conversations/{id}/delivered` — mark received messages delivered.
