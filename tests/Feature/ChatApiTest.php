@@ -90,7 +90,7 @@ class ChatApiTest extends TestCase
             ->assertJsonPath('data.0.body', 'Group hello everyone');
     }
 
-    public function test_group_member_can_be_removed_and_member_can_leave_the_group(): void
+    public function test_only_creator_can_remove_members_and_other_members_can_leave(): void
     {
         $owner = User::factory()->create(['phone' => '+15550000011']);
         $memberOne = User::factory()->create(['phone' => '+15550000012']);
@@ -111,6 +111,25 @@ class ChatApiTest extends TestCase
             'friend_ids' => [$memberOne->id, $memberTwo->id],
         ])->assertCreated()->json();
 
+        Sanctum::actingAs($memberTwo);
+        $this->deleteJson("/api/groups/{$group['id']}/members/{$memberOne->id}")
+            ->assertForbidden();
+        $this->deleteJson("/api/groups/{$group['id']}/members/{$memberTwo->id}")
+            ->assertForbidden();
+        $this->postJson("/api/groups/{$group['id']}/leave")
+            ->assertOk()
+            ->assertJsonPath('message', 'You left the group.');
+
+        $this->assertDatabaseMissing('conversation_users', [
+            'conversation_id' => $group['id'],
+            'user_id' => $memberTwo->id,
+        ]);
+
+        Sanctum::actingAs($owner);
+        $this->postJson("/api/groups/{$group['id']}/leave")
+            ->assertForbidden();
+        $this->deleteJson("/api/groups/{$group['id']}/members/{$owner->id}")
+            ->assertForbidden();
         $this->deleteJson("/api/groups/{$group['id']}/members/{$memberOne->id}")
             ->assertOk()
             ->assertJsonPath('removed_user_id', $memberOne->id);
@@ -120,15 +139,9 @@ class ChatApiTest extends TestCase
             'user_id' => $memberOne->id,
         ]);
 
-        Sanctum::actingAs($memberTwo);
-        $this->postJson("/api/groups/{$group['id']}/leave")
-            ->assertOk()
-            ->assertJsonPath('message', 'You left the group.');
-
-        $this->assertDatabaseMissing('conversation_users', [
-            'conversation_id' => $group['id'],
-            'user_id' => $memberTwo->id,
-        ]);
+        Sanctum::actingAs($memberOne);
+        $this->getJson("/api/conversations/{$group['id']}/messages")
+            ->assertNotFound();
     }
 
     public function test_users_can_unfriend_each_other_and_clear_their_direct_conversation(): void

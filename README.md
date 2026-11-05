@@ -55,6 +55,14 @@ token. Include it on protected requests as `Authorization: Bearer YOUR_SANCTUM_T
 - `GET /api/conversations/{id}/socket-access` — verifies the authenticated
   user belongs to a conversation before the socket service joins its room.
 
+### Group management
+
+- `POST /api/groups` — create a titled group with accepted friends.
+- `DELETE /api/groups/{id}/members/{user}` — only the group creator can remove
+  another participant; the creator cannot remove themselves.
+- `POST /api/groups/{id}/leave` — a non-creator participant may leave; the
+  creator cannot leave the group.
+
 Every conversation route checks membership. Attachments are stored on the
 private local filesystem disk and are never exposed as public URLs. Downloads
 are sent as attachments with `nosniff`; Socket.IO events should carry message
@@ -77,8 +85,8 @@ Socket.IO events.
 ## Important follow-up
 
 Phone numbers are not verified by SMS yet. Add OTP verification before
-production use. This API does not provide end-to-end encryption, group
-conversations, or offline push notifications.
+production use. This API does not provide end-to-end encryption or offline
+push notifications.
 
 ## Tests
 

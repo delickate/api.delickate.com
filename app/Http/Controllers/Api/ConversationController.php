@@ -188,8 +188,8 @@ class ConversationController extends Controller
             return response()->json(['message' => 'You are not a member of this group.'], 403);
         }
 
-        if ((int) $requestingUserId !== (int) $conversation->created_by_user_id && (int) $requestingUserId !== (int) $user->id) {
-            return response()->json(['message' => 'Only the group creator or the member themselves can remove a member.'], 403);
+        if ((int) $requestingUserId !== (int) $conversation->created_by_user_id) {
+            return response()->json(['message' => 'Only the group creator can remove members.'], 403);
         }
 
         if ((int) $user->id === (int) $conversation->created_by_user_id) {
