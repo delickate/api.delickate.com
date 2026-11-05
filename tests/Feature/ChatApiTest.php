@@ -69,6 +69,8 @@ class ChatApiTest extends TestCase
             ->assertCreated()
             ->assertJsonPath('type', 'group')
             ->assertJsonPath('name', 'Launch team')
+            ->assertJsonPath('created_by', $owner->id)
+            ->assertJsonPath('created_by_user_id', $owner->id)
             ->assertJsonCount(3, 'participants');
 
         $conversationId = $groupResponse->json('id');
@@ -88,6 +90,30 @@ class ChatApiTest extends TestCase
         $this->getJson("/api/conversations/{$conversationId}/messages")
             ->assertOk()
             ->assertJsonPath('data.0.body', 'Group hello everyone');
+    }
+
+    public function test_authenticated_user_can_upload_a_profile_picture(): void
+    {
+        Storage::fake('public');
+        $user = User::factory()->create();
+        Sanctum::actingAs($user);
+
+        $response = $this->post('/api/user/profile-picture', [
+            'profile_picture' => UploadedFile::fake()->image('profile.png'),
+        ]);
+
+        $response->assertOk()
+            ->assertJsonPath('message', 'Profile picture updated.')
+            ->assertJsonPath('user.id', $user->id)
+            ->assertJsonPath('user.avatar_url', route('profile-pictures.show', ['user' => $user->id]));
+
+        $user->refresh();
+        $this->assertNotEmpty($user->profile_picture_path);
+        Storage::disk('public')->assertExists($user->profile_picture_path);
+
+        $this->get(route('profile-pictures.show', ['user' => $user->id]))
+            ->assertOk()
+            ->assertHeader('Content-Type', 'image/png');
     }
 
     public function test_only_creator_can_remove_members_and_other_members_can_leave(): void

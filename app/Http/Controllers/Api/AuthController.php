@@ -86,18 +86,40 @@ class AuthController extends Controller
         $file = $validated['profile_picture'];
 
         if ($user->profile_picture_path) {
-            Storage::disk('public')->delete($user->profile_picture_path);
+            $previousPicturePath = $user->profile_picture_path;
         }
 
         $fileName = sprintf('profile-pictures/%s/%s.%s', $user->id, md5(uniqid((string) $user->id, true)), strtolower($file->getClientOriginalExtension() ?: 'jpg'));
         $storedPath = $file->storeAs('', $fileName, ['disk' => 'public']);
+        if (! $storedPath) {
+            return response()->json(['message' => 'The profile picture could not be saved. Check the public storage configuration.'], 500);
+        }
 
         $user->update(['profile_picture_path' => $storedPath]);
+        if (isset($previousPicturePath)) {
+            Storage::disk('public')->delete($previousPicturePath);
+        }
 
         return response()->json([
             'message' => 'Profile picture updated.',
             'user' => $this->userData($user->fresh()),
         ]);
+    }
+
+    public function profilePicture(User $user)
+    {
+        abort_unless(
+            $user->profile_picture_path &&
+                Storage::disk('public')->exists($user->profile_picture_path),
+            404
+        );
+
+        return Storage::disk('public')->response(
+            $user->profile_picture_path,
+            null,
+            ['Cache-Control' => 'public, max-age=86400'],
+            'inline'
+        );
     }
 
     private function userData(User $user): array

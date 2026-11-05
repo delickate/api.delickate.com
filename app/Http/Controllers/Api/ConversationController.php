@@ -402,6 +402,7 @@ class ConversationController extends Controller
                 ->values()
                 ->all();
             $payload['created_by_user_id'] = $conversation->created_by_user_id;
+            $payload['created_by'] = $conversation->created_by_user_id;
         }
 
         return $payload;

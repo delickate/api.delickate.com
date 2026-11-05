@@ -28,6 +28,8 @@ Route::get('/', function () {
 
 Route::post('/auth/register', [AuthController::class, 'register'])->middleware('throttle:10,1');
 Route::post('/auth/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
+Route::get('/profile-pictures/{user}', [AuthController::class, 'profilePicture'])
+    ->name('profile-pictures.show');
 
 Route::middleware('auth:sanctum')->group(function () {
     Route::post('/auth/logout', [AuthController::class, 'logout']);
