@@ -104,14 +104,24 @@ class ChatApiTest extends TestCase
 
         $response->assertOk()
             ->assertJsonPath('message', 'Profile picture updated.')
-            ->assertJsonPath('user.id', $user->id)
-            ->assertJsonPath('user.avatar_url', route('profile-pictures.show', ['user' => $user->id]));
+            ->assertJsonPath('user.id', $user->id);
 
         $user->refresh();
         $this->assertNotEmpty($user->profile_picture_path);
         Storage::disk('public')->assertExists($user->profile_picture_path);
+        $response->assertJsonPath('user.avatar_url', $user->avatar_url);
+        $previousAvatarUrl = $user->avatar_url;
 
-        $this->get(route('profile-pictures.show', ['user' => $user->id]))
+        $replacementResponse = $this->post('/api/user/profile-picture', [
+            'profile_picture' => UploadedFile::fake()->image('replacement.png'),
+        ]);
+        $replacementResponse->assertOk();
+        $user->refresh();
+        $this->assertNotSame($previousAvatarUrl, $user->avatar_url);
+        $replacementResponse->assertJsonPath('user.avatar_url', $user->avatar_url);
+        Storage::disk('public')->assertExists($user->profile_picture_path);
+
+        $this->get($user->avatar_url)
             ->assertOk()
             ->assertHeader('Content-Type', 'image/png');
     }

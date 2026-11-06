@@ -56,6 +56,9 @@ class User extends Authenticatable
             return null;
         }
 
-        return route('profile-pictures.show', ['user' => $this->getKey()]);
+        return route('profile-pictures.show', [
+            'user' => $this->getKey(),
+            'v' => hash('sha256', $this->profile_picture_path),
+        ]);
     }
 }
