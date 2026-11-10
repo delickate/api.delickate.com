@@ -353,6 +353,45 @@ class ConversationController extends Controller
         return response()->json($messages);
     }
 
+    public function callHistory(Request $request): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        $callHistory = Message::query()
+            ->where('type', 'call')
+            ->whereHas('conversation', fn ($query) => $query
+                ->where('type', 'direct')
+                ->where(fn ($participantQuery) => $participantQuery
+                    ->where('low_user_id', $userId)
+                    ->orWhere('high_user_id', $userId)))
+            ->with([
+                'conversation:id,low_user_id,high_user_id',
+                'conversation.lowUser:id,name,phone,profile_picture_path',
+                'conversation.highUser:id,name,phone,profile_picture_path',
+            ])
+            ->orderByDesc('id')
+            ->paginate(100);
+
+        $callHistory->getCollection()->transform(function (Message $message) use ($userId) {
+            $conversation = $message->conversation;
+            $otherUser = (int) $conversation->low_user_id === $userId
+                ? $conversation->highUser
+                : $conversation->lowUser;
+
+            return [
+                'id' => $message->id,
+                'conversation_id' => $message->conversation_id,
+                'contact' => $this->publicUser($otherUser),
+                'direction' => (int) $message->sender_id === $userId ? 'outgoing' : 'incoming',
+                'status' => $message->call_status,
+                'media_type' => $message->call_media_type,
+                'duration_seconds' => $message->call_duration_seconds,
+                'created_at' => $message->created_at,
+            ];
+        });
+
+        return response()->json($callHistory);
+    }
+
     public function recordCall(Request $request, Conversation $conversation): JsonResponse
     {
         $userId = (int) $request->user()->id;

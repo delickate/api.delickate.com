@@ -47,6 +47,9 @@ token. Include it on protected requests as `Authorization: Bearer YOUR_SANCTUM_T
 
 - `GET /api/conversations` — paginated conversations, latest message, and
   unread count.
+- `GET /api/call-history` — paginated call log for the authenticated user,
+  including contact, direction, time, missed/completed status, media type, and
+  duration.
 - `POST /api/conversations` — request body: `friend_id`; requires an accepted
   friendship.
 - `GET /api/conversations/{id}/messages` — paginated message history.

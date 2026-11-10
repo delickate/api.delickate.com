@@ -142,6 +142,22 @@ class ChatApiTest extends TestCase
             ->assertJsonPath('data.0.call.status', 'completed')
             ->assertJsonPath('data.0.call.duration_seconds', 125)
             ->assertJsonPath('data.1.call.status', 'missed');
+        $this->getJson('/api/call-history')
+            ->assertOk()
+            ->assertJsonCount(2, 'data')
+            ->assertJsonPath('data.0.contact.id', $caller->id)
+            ->assertJsonPath('data.0.direction', 'incoming')
+            ->assertJsonPath('data.0.status', 'completed')
+            ->assertJsonPath('data.0.media_type', 'video')
+            ->assertJsonPath('data.0.duration_seconds', 125)
+            ->assertJsonPath('data.1.status', 'missed')
+            ->assertJsonPath('data.1.media_type', 'audio');
+
+        Sanctum::actingAs($caller);
+        $this->getJson('/api/call-history')
+            ->assertOk()
+            ->assertJsonPath('data.0.contact.id', $callee->id)
+            ->assertJsonPath('data.0.direction', 'outgoing');
     }
 
     public function test_authenticated_user_can_upload_a_profile_picture(): void

@@ -48,6 +48,7 @@ Route::middleware('auth:sanctum')->group(function () {
         ->whereIn('action', ['accept', 'reject']);
 
     Route::get('/conversations', [ConversationController::class, 'index']);
+    Route::get('/call-history', [ConversationController::class, 'callHistory']);
     Route::post('/groups', [ConversationController::class, 'createGroup']);
     Route::post('/groups/{conversation}/members', [ConversationController::class, 'addMember']);
     Route::post('/groups/{conversation}/leave', [ConversationController::class, 'leaveGroup']);
