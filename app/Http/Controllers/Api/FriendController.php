@@ -19,6 +19,14 @@ class FriendController extends Controller
         $friends = FriendRequest::query()
             ->where('status', 'accepted')
             ->where(fn ($query) => $query->where('low_user_id', $userId)->orWhere('high_user_id', $userId))
+            ->whereNotExists(fn ($query) => $query->selectRaw('1')
+                ->from('user_blocks')
+                ->whereColumn('user_blocks.blocker_id', 'friend_requests.low_user_id')
+                ->whereColumn('user_blocks.blocked_id', 'friend_requests.high_user_id'))
+            ->whereNotExists(fn ($query) => $query->selectRaw('1')
+                ->from('user_blocks')
+                ->whereColumn('user_blocks.blocker_id', 'friend_requests.high_user_id')
+                ->whereColumn('user_blocks.blocked_id', 'friend_requests.low_user_id'))
             ->with(['lowUser:id,name,phone', 'highUser:id,name,phone'])
             ->orderByDesc('updated_at')
             ->paginate(50);
@@ -30,8 +38,53 @@ class FriendController extends Controller
                     : $friendRequest->lowUser
             );
         });
-
         return response()->json($friends);
+    }
+
+    public function blockedUsers(Request $request): JsonResponse
+    {
+        $blockedUsers = $request->user()->blocksMade()
+            ->select('users.id', 'users.name', 'users.phone', 'users.profile_picture_path')
+            ->orderByDesc('user_blocks.created_at')
+            ->paginate(50);
+        $blockedUsers->getCollection()->transform(fn (User $user) => $this->publicUser($user));
+
+        return response()->json($blockedUsers);
+    }
+
+    public function block(Request $request, User $user): JsonResponse
+    {
+        $blockerId = (int) $request->user()->id;
+        if ($blockerId === (int) $user->id) {
+            throw ValidationException::withMessages(['user' => ['You cannot block yourself.']]);
+        }
+
+        DB::transaction(function () use ($request, $user): void {
+            $request->user()->blocksMade()->syncWithoutDetaching([$user->id]);
+            FriendRequest::query()
+                ->where('status', 'pending')
+                ->where('low_user_id', min((int) $request->user()->id, (int) $user->id))
+                ->where('high_user_id', max((int) $request->user()->id, (int) $user->id))
+                ->delete();
+        });
+
+        return response()->json([
+            'message' => 'User blocked.',
+            'user_id' => $user->id,
+        ]);
+    }
+
+    public function unblock(Request $request, User $user): JsonResponse
+    {
+        $deleted = $request->user()->blocksMade()->detach($user->id);
+        if ($deleted === 0) {
+            return response()->json(['message' => 'This user is not in your blocked list.'], 404);
+        }
+
+        return response()->json([
+            'message' => 'User unblocked.',
+            'user_id' => $user->id,
+        ]);
     }
 
     public function requests(Request $request): JsonResponse
@@ -51,6 +104,14 @@ class FriendController extends Controller
                 ->orWhere('high_user_id', $userId))
                 ->where('sender_id', '!=', $userId);
         }
+        $query->whereNotExists(fn ($builder) => $builder->selectRaw('1')
+            ->from('user_blocks')
+            ->whereColumn('user_blocks.blocker_id', 'friend_requests.low_user_id')
+            ->whereColumn('user_blocks.blocked_id', 'friend_requests.high_user_id'))
+            ->whereNotExists(fn ($builder) => $builder->selectRaw('1')
+                ->from('user_blocks')
+                ->whereColumn('user_blocks.blocker_id', 'friend_requests.high_user_id')
+                ->whereColumn('user_blocks.blocked_id', 'friend_requests.low_user_id'));
 
         $requests = $query
             ->with(['sender:id,name,phone', 'lowUser:id,name,phone', 'highUser:id,name,phone'])
@@ -89,6 +150,9 @@ class FriendController extends Controller
 
         $userId = (int) $user->id;
         $friendId = (int) $friend->id;
+        if ($this->usersHaveBlock($userId, $friendId)) {
+            throw ValidationException::withMessages(['phone' => ['This user cannot be added while either of you has blocked the other.']]);
+        }
         $lowId = min($userId, $friendId);
         $highId = max($userId, $friendId);
 
@@ -145,6 +209,10 @@ class FriendController extends Controller
 
         if ($friendRequest->status !== 'pending') {
             return response()->json(['message' => 'This request has already been handled.'], 409);
+        }
+        if ($action === 'accept' &&
+            $this->usersHaveBlock((int) $friendRequest->low_user_id, (int) $friendRequest->high_user_id)) {
+            return response()->json(['message' => 'This friend request cannot be accepted while either user has blocked the other.'], 409);
         }
 
         $friendRequest->update(['status' => $action === 'accept' ? 'accepted' : 'rejected']);
@@ -204,5 +272,17 @@ class FriendController extends Controller
             'phone' => $user->phone,
             'avatar_url' => $user->avatar_url,
         ];
+    }
+
+    private function usersHaveBlock(int $firstUserId, int $secondUserId): bool
+    {
+        return DB::table('user_blocks')
+            ->where(fn ($query) => $query
+                ->where('blocker_id', $firstUserId)
+                ->where('blocked_id', $secondUserId))
+            ->orWhere(fn ($query) => $query
+                ->where('blocker_id', $secondUserId)
+                ->where('blocked_id', $firstUserId))
+            ->exists();
     }
 }

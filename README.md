@@ -29,9 +29,16 @@ token. Include it on protected requests as `Authorization: Bearer YOUR_SANCTUM_T
 ### Friends
 
 - `GET /api/friends` — accepted friends.
+- `GET /api/blocks` — users you have blocked.
+- `POST /api/users/{user}/block` and `DELETE /api/users/{user}/block` — block
+  or unblock a user. Blocking hides direct chats and prevents direct messages
+  and friend requests in either direction; existing friendship is restored
+  when the blocker unblocks the user.
 - `GET /api/friends/requests?direction=incoming|outgoing` — pending requests
   (defaults to incoming).
 - `POST /api/friends/requests` — request body: `phone`.
+  An accepted friend cannot be added again; the API responds that this user is
+  already your friend.
 - `POST /api/friends/requests/{id}/accept` or `/reject` — respond as recipient.
 
 ### Direct messages

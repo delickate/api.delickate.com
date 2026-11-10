@@ -38,6 +38,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/user/profile-picture', [AuthController::class, 'updateProfilePicture']);
 
     Route::get('/friends', [FriendController::class, 'index']);
+    Route::get('/blocks', [FriendController::class, 'blockedUsers']);
+    Route::post('/users/{user}/block', [FriendController::class, 'block']);
+    Route::delete('/users/{user}/block', [FriendController::class, 'unblock']);
     Route::delete('/friends/{user}', [FriendController::class, 'destroy']);
     Route::get('/friends/requests', [FriendController::class, 'requests']);
     Route::post('/friends/requests', [FriendController::class, 'storeRequest']);

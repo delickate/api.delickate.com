@@ -26,6 +26,14 @@ class ConversationController extends Controller
                         ->orWhere('high_user_id', $userId);
                 })->orWhereHas('participants', fn ($participantQuery) => $participantQuery->where('users.id', $userId));
             })
+            ->whereNotExists(fn ($query) => $query->selectRaw('1')
+                ->from('user_blocks')
+                ->whereColumn('user_blocks.blocker_id', 'conversations.low_user_id')
+                ->whereColumn('user_blocks.blocked_id', 'conversations.high_user_id'))
+            ->whereNotExists(fn ($query) => $query->selectRaw('1')
+                ->from('user_blocks')
+                ->whereColumn('user_blocks.blocker_id', 'conversations.high_user_id')
+                ->whereColumn('user_blocks.blocked_id', 'conversations.low_user_id'))
             ->with([
                 'lowUser:id,name,phone,profile_picture_path',
                 'highUser:id,name,phone,profile_picture_path',
@@ -71,6 +79,9 @@ class ConversationController extends Controller
 
         $lowId = min($userId, $friendId);
         $highId = max($userId, $friendId);
+        if ($this->usersHaveBlock($userId, $friendId)) {
+            return response()->json(['message' => 'You cannot start a conversation while either user has blocked the other.'], 403);
+        }
         $isFriend = FriendRequest::where('low_user_id', $lowId)
             ->where('high_user_id', $highId)
             ->where('status', 'accepted')
@@ -291,6 +302,10 @@ class ConversationController extends Controller
         if (! $this->userIsParticipant($conversation, $userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
         }
+        if ($conversation->type !== 'group' &&
+            $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
+            return response()->json(['message' => 'This direct conversation is unavailable.'], 404);
+        }
 
         if ($conversation->type === 'group') {
             return response()->json([
@@ -318,6 +333,10 @@ class ConversationController extends Controller
         if (! $this->userIsParticipant($conversation, $userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
         }
+        if ($conversation->type !== 'group' &&
+            $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
+            return response()->json(['message' => 'This direct conversation is unavailable.'], 404);
+        }
 
         $messages = $conversation->messages()
             ->whereDoesntHave('hiddenFromUsers', fn ($query) => $query->where('users.id', $userId))
@@ -339,6 +358,10 @@ class ConversationController extends Controller
 
         if (! $this->userIsParticipant($conversation, $userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
+        }
+        if ($conversation->type !== 'group' &&
+            $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
+            return response()->json(['message' => 'This direct conversation is unavailable.'], 404);
         }
 
         $validated = $request->validate([
@@ -404,6 +427,8 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
         if (! $this->userIsParticipant($conversation, $userId)
+            || ($conversation->type !== 'group' &&
+                $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id))
             || (int) $message->conversation_id !== (int) $conversation->id
             || $message->deleted_for_everyone_at
             || $message->hiddenFromUsers()->where('users.id', $userId)->exists()) {
@@ -415,6 +440,10 @@ class ConversationController extends Controller
         ]);
         $targetConversation = Conversation::findOrFail($validated['target_conversation_id']);
         if (! $this->userIsParticipant($targetConversation, $userId)) {
+            return response()->json(['message' => 'Target conversation not found.'], 404);
+        }
+        if ($targetConversation->type !== 'group' &&
+            $this->usersHaveBlock((int) $targetConversation->low_user_id, (int) $targetConversation->high_user_id)) {
             return response()->json(['message' => 'Target conversation not found.'], 404);
         }
         if ((int) $targetConversation->id === (int) $conversation->id) {
@@ -515,7 +544,9 @@ class ConversationController extends Controller
 
         if (! $this->userIsParticipant($conversation, $userId)
             || (int) $message->conversation_id !== (int) $conversation->id
-            || ! $message->attachment_path) {
+            || ! $message->attachment_path
+            || ($conversation->type !== 'group' &&
+                $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id))) {
             return response()->json(['message' => 'Attachment not found.'], 404);
         }
 
@@ -544,6 +575,10 @@ class ConversationController extends Controller
         $userId = (int) $request->user()->id;
 
         if (! $this->userIsParticipant($conversation, $userId)) {
+            return response()->json(['message' => 'Conversation not found.'], 404);
+        }
+        if ($conversation->type !== 'group' &&
+            $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
         }
 
@@ -665,6 +700,18 @@ class ConversationController extends Controller
         }
 
         return $conversation->participants()->whereKey($userId)->exists();
+    }
+
+    private function usersHaveBlock(int $firstUserId, int $secondUserId): bool
+    {
+        return DB::table('user_blocks')
+            ->where(fn ($query) => $query
+                ->where('blocker_id', $firstUserId)
+                ->where('blocked_id', $secondUserId))
+            ->orWhere(fn ($query) => $query
+                ->where('blocker_id', $secondUserId)
+                ->where('blocked_id', $firstUserId))
+            ->exists();
     }
 
     private function publicUser(?User $user): ?array

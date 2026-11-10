@@ -279,6 +279,75 @@ class ChatApiTest extends TestCase
         }
     }
 
+    public function test_adding_an_existing_friend_returns_an_already_added_message(): void
+    {
+        [$sender, $recipient] = $this->makeConversation();
+        FriendRequest::create([
+            'low_user_id' => min($sender->id, $recipient->id),
+            'high_user_id' => max($sender->id, $recipient->id),
+            'sender_id' => $sender->id,
+            'status' => 'accepted',
+        ]);
+
+        Sanctum::actingAs($sender);
+        $this->postJson('/api/friends/requests', ['phone' => $recipient->phone])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('phone')
+            ->assertJsonPath('errors.phone.0', 'This user is already your friend.');
+    }
+
+    public function test_blocking_hides_friendship_and_disables_direct_chat_until_unblocked(): void
+    {
+        [$blocker, $blocked, $conversation] = $this->makeConversation();
+        FriendRequest::create([
+            'low_user_id' => min($blocker->id, $blocked->id),
+            'high_user_id' => max($blocker->id, $blocked->id),
+            'sender_id' => $blocker->id,
+            'status' => 'accepted',
+        ]);
+
+        Sanctum::actingAs($blocker);
+        $this->postJson("/api/users/{$blocked->id}/block")
+            ->assertOk()
+            ->assertJsonPath('message', 'User blocked.');
+        $this->getJson('/api/blocks')
+            ->assertOk()
+            ->assertJsonPath('data.0.id', $blocked->id);
+        $this->getJson('/api/friends')
+            ->assertOk()
+            ->assertJsonCount(0, 'data');
+        $this->getJson('/api/conversations')
+            ->assertOk()
+            ->assertJsonCount(0, 'data');
+        Sanctum::actingAs($blocked);
+        $this->getJson('/api/friends')
+            ->assertOk()
+            ->assertJsonCount(0, 'data');
+        $this->getJson('/api/conversations')
+            ->assertOk()
+            ->assertJsonCount(0, 'data');
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertNotFound();
+        Sanctum::actingAs($blocker);
+        $this->postJson('/api/friends/requests', ['phone' => $blocked->phone])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('phone');
+
+        Sanctum::actingAs($blocked);
+        $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => 'Blocked message'])
+            ->assertNotFound();
+
+        Sanctum::actingAs($blocker);
+        $this->deleteJson("/api/users/{$blocked->id}/block")
+            ->assertOk()
+            ->assertJsonPath('message', 'User unblocked.');
+        $this->getJson('/api/friends')
+            ->assertOk()
+            ->assertJsonPath('data.0.id', $blocked->id);
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk();
+    }
+
     public function test_message_body_is_encrypt_at_rest_and_decrypt_on_response(): void
     {
         [$sender, $recipient, $conversation] = $this->makeConversation();

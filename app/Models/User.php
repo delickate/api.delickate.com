@@ -4,6 +4,7 @@ namespace App\Models;
 
 // use Illuminate\Contracts\Auth\MustVerifyEmail;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 use Laravel\Sanctum\HasApiTokens;
@@ -49,6 +50,18 @@ class User extends Authenticatable
         'dob' => 'date',
         'password' => 'hashed',
     ];
+
+    public function blocksMade(): BelongsToMany
+    {
+        return $this->belongsToMany(self::class, 'user_blocks', 'blocker_id', 'blocked_id')
+            ->withTimestamps();
+    }
+
+    public function blocksReceived(): BelongsToMany
+    {
+        return $this->belongsToMany(self::class, 'user_blocks', 'blocked_id', 'blocker_id')
+            ->withTimestamps();
+    }
 
     public function getAvatarUrlAttribute(): ?string
     {
