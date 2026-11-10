@@ -50,6 +50,10 @@ token. Include it on protected requests as `Authorization: Bearer YOUR_SANCTUM_T
 - `POST /api/conversations` — request body: `friend_id`; requires an accepted
   friendship.
 - `GET /api/conversations/{id}/messages` — paginated message history.
+- `POST /api/conversations/{id}/calls` — save a call outcome with `call_id`,
+  `caller_id`, `status` (`missed` or `completed`), `media_type` (`audio` or
+  `video`), and `duration_seconds`. Call entries are returned in message
+  history, and repeated submissions for the same call are idempotent.
 - `POST /api/conversations/{id}/messages` — request body: `body` and optional
   `attachment` multipart upload. Send text, an attachment, or both. Attachments
   are limited to 5 MiB and allow JPEG, PNG, GIF, WebP, PDF, and UTF-8 plain

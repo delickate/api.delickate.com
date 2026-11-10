@@ -7,6 +7,7 @@ use App\Models\Conversation;
 use App\Models\FriendRequest;
 use App\Models\Message;
 use App\Models\User;
+use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -352,6 +353,72 @@ class ConversationController extends Controller
         return response()->json($messages);
     }
 
+    public function recordCall(Request $request, Conversation $conversation): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        if (! $this->userIsParticipant($conversation, $userId)) {
+            return response()->json(['message' => 'Conversation not found.'], 404);
+        }
+        if ($conversation->type === 'group' ||
+            $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
+            return response()->json(['message' => 'This direct conversation is unavailable.'], 404);
+        }
+
+        $validated = $request->validate([
+            'call_id' => ['required', 'uuid'],
+            'caller_id' => ['required', 'integer'],
+            'status' => ['required', 'in:missed,completed'],
+            'media_type' => ['required', 'in:audio,video'],
+            'duration_seconds' => ['required', 'integer', 'min:0', 'max:86400'],
+        ]);
+        $participantIds = [(int) $conversation->low_user_id, (int) $conversation->high_user_id];
+        if (! in_array((int) $validated['caller_id'], $participantIds, true)) {
+            throw ValidationException::withMessages([
+                'caller_id' => ['The caller must be a participant in this conversation.'],
+            ]);
+        }
+
+        $existing = Message::query()->where('call_id', $validated['call_id'])->first();
+        if ($existing) {
+            if ((int) $existing->conversation_id !== (int) $conversation->id) {
+                return response()->json(['message' => 'This call record already belongs to another conversation.'], 409);
+            }
+
+            $existing->load('sender:id,name,phone,profile_picture_path');
+            return response()->json($this->messageData($existing, $userId));
+        }
+
+        try {
+            $message = DB::transaction(function () use ($conversation, $validated) {
+                $message = $conversation->messages()->create([
+                    'sender_id' => (int) $validated['caller_id'],
+                    'type' => 'call',
+                    'call_id' => $validated['call_id'],
+                    'call_status' => $validated['status'],
+                    'call_media_type' => $validated['media_type'],
+                    'call_duration_seconds' => $validated['status'] === 'completed'
+                        ? (int) $validated['duration_seconds']
+                        : null,
+                ]);
+                $conversation->touch();
+
+                return $message;
+            });
+        } catch (QueryException $exception) {
+            $message = Message::query()->where('call_id', $validated['call_id'])->first();
+            if (! $message) {
+                throw $exception;
+            }
+            if ((int) $message->conversation_id !== (int) $conversation->id) {
+                return response()->json(['message' => 'This call record already belongs to another conversation.'], 409);
+            }
+        }
+
+        $message->load('sender:id,name,phone,profile_picture_path');
+
+        return response()->json($this->messageData($message, $userId), 201);
+    }
+
     public function send(Request $request, Conversation $conversation): JsonResponse
     {
         $userId = (int) $request->user()->id;
@@ -687,6 +754,11 @@ class ConversationController extends Controller
                 'size' => $message->attachment_size,
             ] : null,
             'is_forwarded' => (bool) $message->is_forwarded,
+            'call' => $message->type === 'call' ? [
+                'status' => $message->call_status,
+                'media_type' => $message->call_media_type,
+                'duration_seconds' => $message->call_duration_seconds,
+            ] : null,
             'created_at' => $message->created_at,
             'delivered_at' => $message->delivered_at,
             'read_at' => $message->read_at,

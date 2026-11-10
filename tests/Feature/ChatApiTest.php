@@ -96,6 +96,54 @@ class ChatApiTest extends TestCase
             ->assertJsonPath('data.0.body', 'Group hello everyone');
     }
 
+    public function test_call_logs_are_saved_in_conversation_history_and_are_idempotent(): void
+    {
+        $caller = User::factory()->create(['phone' => '+15550000031']);
+        $callee = User::factory()->create(['phone' => '+15550000032']);
+        $conversation = Conversation::create([
+            'low_user_id' => min($caller->id, $callee->id),
+            'high_user_id' => max($caller->id, $callee->id),
+        ]);
+        $missedCall = [
+            'call_id' => '11111111-1111-4111-8111-111111111111',
+            'caller_id' => $caller->id,
+            'status' => 'missed',
+            'media_type' => 'audio',
+            'duration_seconds' => 0,
+        ];
+
+        Sanctum::actingAs($caller);
+        $missedResponse = $this->postJson("/api/conversations/{$conversation->id}/calls", $missedCall)
+            ->assertCreated()
+            ->assertJsonPath('type', 'call')
+            ->assertJsonPath('call.status', 'missed')
+            ->assertJsonPath('call.media_type', 'audio');
+        $missedMessageId = $missedResponse->json('id');
+
+        $completedCall = [
+            'call_id' => '22222222-2222-4222-8222-222222222222',
+            'caller_id' => $caller->id,
+            'status' => 'completed',
+            'media_type' => 'video',
+            'duration_seconds' => 125,
+        ];
+        $this->postJson("/api/conversations/{$conversation->id}/calls", $completedCall)
+            ->assertCreated()
+            ->assertJsonPath('call.status', 'completed')
+            ->assertJsonPath('call.duration_seconds', 125);
+
+        Sanctum::actingAs($callee);
+        $this->postJson("/api/conversations/{$conversation->id}/calls", $missedCall)
+            ->assertOk()
+            ->assertJsonPath('id', $missedMessageId);
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()
+            ->assertJsonCount(2, 'data')
+            ->assertJsonPath('data.0.call.status', 'completed')
+            ->assertJsonPath('data.0.call.duration_seconds', 125)
+            ->assertJsonPath('data.1.call.status', 'missed');
+    }
+
     public function test_authenticated_user_can_upload_a_profile_picture(): void
     {
         Storage::fake('public');

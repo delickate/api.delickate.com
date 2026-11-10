@@ -19,6 +19,10 @@ class Message extends Model
         'attachment_mime',
         'attachment_size',
         'is_forwarded',
+        'call_id',
+        'call_status',
+        'call_media_type',
+        'call_duration_seconds',
         'delivered_at',
         'read_at',
         'deleted_for_everyone_at',
@@ -28,6 +32,7 @@ class Message extends Model
         'delivered_at' => 'datetime',
         'read_at' => 'datetime',
         'is_forwarded' => 'boolean',
+        'call_duration_seconds' => 'integer',
         'deleted_for_everyone_at' => 'datetime',
     ];
 

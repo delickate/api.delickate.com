@@ -56,6 +56,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/conversations/{conversation}/socket-access', [ConversationController::class, 'socketAccess']);
     Route::get('/conversations/{conversation}/messages', [ConversationController::class, 'messages']);
     Route::post('/conversations/{conversation}/messages', [ConversationController::class, 'send']);
+    Route::post('/conversations/{conversation}/calls', [ConversationController::class, 'recordCall']);
     Route::post('/conversations/{conversation}/messages/{message}/forward', [ConversationController::class, 'forward']);
     Route::delete('/conversations/{conversation}/messages/{message}', [ConversationController::class, 'deleteMessage']);
     Route::get('/conversations/{conversation}/messages/{message}/attachment', [ConversationController::class, 'downloadAttachment']);
