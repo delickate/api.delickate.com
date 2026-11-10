@@ -75,6 +75,10 @@ class ChatApiTest extends TestCase
 
         $conversationId = $groupResponse->json('id');
 
+        $this->getJson("/api/conversations/{$conversationId}/socket-access")
+            ->assertOk()
+            ->assertJsonCount(3, 'participant_ids');
+
         $this->getJson('/api/conversations')
             ->assertOk()
             ->assertJsonPath('data.0.type', 'group')
@@ -324,6 +328,76 @@ class ChatApiTest extends TestCase
         ])->assertUnprocessable()->assertJsonValidationErrors('reply_to_message_id');
     }
 
+    public function test_user_can_forward_a_message_to_another_conversation(): void
+    {
+        [$sender, , $sourceConversation] = $this->makeConversation();
+        $targetFriend = User::factory()->create();
+        $targetConversation = Conversation::create([
+            'low_user_id' => min($sender->id, $targetFriend->id),
+            'high_user_id' => max($sender->id, $targetFriend->id),
+        ]);
+        $outsider = User::factory()->create();
+        $unauthorizedConversation = Conversation::create([
+            'low_user_id' => min($outsider->id, $targetFriend->id),
+            'high_user_id' => max($outsider->id, $targetFriend->id),
+        ]);
+
+        Sanctum::actingAs($sender);
+        $messageId = $this->postJson("/api/conversations/{$sourceConversation->id}/messages", [
+            'body' => 'Please review this update.',
+        ])->assertCreated()->json('id');
+
+        $this->postJson("/api/conversations/{$sourceConversation->id}/messages/{$messageId}/forward", [
+            'target_conversation_id' => $targetConversation->id,
+        ])->assertCreated()
+            ->assertJsonPath('body', 'Please review this update.')
+            ->assertJsonPath('is_forwarded', true)
+            ->assertJsonPath('sender.id', $sender->id);
+
+        $this->postJson("/api/conversations/{$sourceConversation->id}/messages/{$messageId}/forward", [
+            'target_conversation_id' => $unauthorizedConversation->id,
+        ])->assertNotFound();
+    }
+
+    public function test_forwarding_copies_private_attachments(): void
+    {
+        Storage::fake('private');
+        [$sender, , $sourceConversation] = $this->makeConversation();
+        $targetFriend = User::factory()->create();
+        $targetConversation = Conversation::create([
+            'low_user_id' => min($sender->id, $targetFriend->id),
+            'high_user_id' => max($sender->id, $targetFriend->id),
+        ]);
+        $sourcePath = "messages/{$sourceConversation->id}/private-file.pdf";
+        Storage::disk('private')->put($sourcePath, "%PDF-1.4\nprivate\n%%EOF");
+        $message = $sourceConversation->messages()->create([
+            'sender_id' => $sender->id,
+            'body' => null,
+            'type' => 'file',
+            'attachment_path' => $sourcePath,
+            'attachment_name' => 'private.pdf',
+            'attachment_mime' => 'application/pdf',
+            'attachment_size' => 24,
+        ]);
+
+        Sanctum::actingAs($sender);
+        $forwarded = $this->postJson(
+            "/api/conversations/{$sourceConversation->id}/messages/{$message->id}/forward",
+            ['target_conversation_id' => $targetConversation->id],
+        )->assertCreated()
+            ->assertJsonPath('is_forwarded', true)
+            ->assertJsonPath('attachment.name', 'private.pdf')
+            ->json();
+
+        $forwardedMessage = Message::findOrFail($forwarded['id']);
+        $this->assertNotSame($sourcePath, $forwardedMessage->attachment_path);
+        Storage::disk('private')->assertExists($forwardedMessage->attachment_path);
+        $this->assertSame(
+            Storage::disk('private')->get($sourcePath),
+            Storage::disk('private')->get($forwardedMessage->attachment_path),
+        );
+    }
+
     public function test_messages_can_be_deleted_for_me_or_everyone_with_sender_authorization(): void
     {
         Storage::fake('private');
@@ -428,7 +502,8 @@ class ChatApiTest extends TestCase
         $this->getJson("/api/conversations/{$conversation->id}/socket-access")
             ->assertOk()
             ->assertJsonPath('conversation_id', $conversation->id)
-            ->assertJsonPath('peer_id', $recipient->id);
+            ->assertJsonPath('peer_id', $recipient->id)
+            ->assertJsonPath('participant_ids', [$sender->id, $recipient->id]);
     }
 
     public function test_friend_can_send_and_download_a_private_attachment(): void

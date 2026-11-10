@@ -47,6 +47,10 @@ token. Include it on protected requests as `Authorization: Bearer YOUR_SANCTUM_T
   text only; extension, detected MIME type, and file signature are checked.
 - Include `reply_to_message_id` when sending to reply to a message in that
   conversation.
+- `POST /api/conversations/{id}/messages/{message}/forward` — request body:
+  `target_conversation_id`; copies a visible message and any private attachment
+  into another conversation where the authenticated user is a participant.
+  Forwarded messages are returned with `is_forwarded: true`.
 - `DELETE /api/conversations/{id}/messages/{message}` — request body `scope` is
   `me` to hide the message only for the current participant, or `everyone` to
   delete the sender's own message for all participants.
@@ -58,7 +62,8 @@ token. Include it on protected requests as `Authorization: Bearer YOUR_SANCTUM_T
 - `GET /api/auth/socket-identity` — authenticated identity lookup for the
   Socket.IO service.
 - `GET /api/conversations/{id}/socket-access` — verifies the authenticated
-  user belongs to a conversation before the socket service joins its room.
+  user belongs to a conversation and returns its `participant_ids` for
+  authorized Socket.IO message notifications.
 
 ### Group management
 

@@ -11,6 +11,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
 class ConversationController extends Controller
@@ -295,6 +296,7 @@ class ConversationController extends Controller
             return response()->json([
                 'conversation_id' => $conversation->id,
                 'peer_id' => null,
+                'participant_ids' => $conversation->participants()->pluck('users.id')->map(fn ($id) => (int) $id)->all(),
             ]);
         }
 
@@ -305,6 +307,7 @@ class ConversationController extends Controller
         return response()->json([
             'conversation_id' => $conversation->id,
             'peer_id' => $peerId,
+            'participant_ids' => [(int) $conversation->low_user_id, (int) $conversation->high_user_id],
         ]);
     }
 
@@ -395,6 +398,68 @@ class ConversationController extends Controller
         ]);
 
         return response()->json($this->messageData($message, $userId), 201);
+    }
+
+    public function forward(Request $request, Conversation $conversation, Message $message): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        if (! $this->userIsParticipant($conversation, $userId)
+            || (int) $message->conversation_id !== (int) $conversation->id
+            || $message->deleted_for_everyone_at
+            || $message->hiddenFromUsers()->where('users.id', $userId)->exists()) {
+            return response()->json(['message' => 'Message not found.'], 404);
+        }
+
+        $validated = $request->validate([
+            'target_conversation_id' => ['required', 'integer', 'exists:conversations,id'],
+        ]);
+        $targetConversation = Conversation::findOrFail($validated['target_conversation_id']);
+        if (! $this->userIsParticipant($targetConversation, $userId)) {
+            return response()->json(['message' => 'Target conversation not found.'], 404);
+        }
+        if ((int) $targetConversation->id === (int) $conversation->id) {
+            throw ValidationException::withMessages([
+                'target_conversation_id' => ['Choose a different conversation to forward this message.'],
+            ]);
+        }
+
+        $copiedPath = null;
+        try {
+            $forwardedMessage = DB::transaction(function () use ($message, $targetConversation, $userId, &$copiedPath) {
+                if ($message->attachment_path) {
+                    $extension = pathinfo($message->attachment_name, PATHINFO_EXTENSION);
+                    $copiedPath = "messages/{$targetConversation->id}/forwarded-".Str::uuid()
+                        .($extension ? ".{$extension}" : '');
+                    if (! Storage::disk('private')->copy($message->attachment_path, $copiedPath)) {
+                        throw new \RuntimeException('The original attachment could not be copied.');
+                    }
+                }
+
+                $forwardedMessage = $targetConversation->messages()->create([
+                    'sender_id' => $userId,
+                    'body' => $message->body,
+                    'type' => $message->type,
+                    'attachment_path' => $copiedPath,
+                    'attachment_name' => $message->attachment_name,
+                    'attachment_mime' => $message->attachment_mime,
+                    'attachment_size' => $message->attachment_size,
+                    'is_forwarded' => true,
+                ]);
+                $targetConversation->touch();
+
+                return $forwardedMessage;
+            });
+        } catch (\Throwable $exception) {
+            if ($copiedPath) {
+                Storage::disk('private')->delete($copiedPath);
+            }
+
+            throw $exception;
+        }
+
+        $forwardedMessage->load('sender:id,name,phone,profile_picture_path');
+
+        return response()->json($this->messageData($forwardedMessage, $userId), 201);
     }
 
     public function deleteMessage(Request $request, Conversation $conversation, Message $message): JsonResponse
@@ -586,6 +651,7 @@ class ConversationController extends Controller
                 'mime' => $message->attachment_mime,
                 'size' => $message->attachment_size,
             ] : null,
+            'is_forwarded' => (bool) $message->is_forwarded,
             'created_at' => $message->created_at,
             'delivered_at' => $message->delivered_at,
             'read_at' => $message->read_at,

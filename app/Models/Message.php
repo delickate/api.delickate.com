@@ -18,6 +18,7 @@ class Message extends Model
         'attachment_name',
         'attachment_mime',
         'attachment_size',
+        'is_forwarded',
         'delivered_at',
         'read_at',
         'deleted_for_everyone_at',
@@ -26,6 +27,7 @@ class Message extends Model
     protected $casts = [
         'delivered_at' => 'datetime',
         'read_at' => 'datetime',
+        'is_forwarded' => 'boolean',
         'deleted_for_everyone_at' => 'datetime',
     ];
 
