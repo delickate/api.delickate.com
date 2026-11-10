@@ -196,7 +196,7 @@ class ChatApiTest extends TestCase
             ->assertNotFound();
     }
 
-    public function test_users_can_unfriend_each_other_and_clear_their_direct_conversation(): void
+    public function test_unfriending_preserves_chat_history_for_when_they_add_each_other_again(): void
     {
         $first = User::factory()->create(['phone' => '+15550000021']);
         $second = User::factory()->create(['phone' => '+15550000022']);
@@ -215,6 +215,10 @@ class ChatApiTest extends TestCase
         ]);
 
         Sanctum::actingAs($first);
+        $messageId = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => 'Keep this conversation history.',
+        ])->assertCreated()->json('id');
+
         $this->deleteJson("/api/friends/{$second->id}")
             ->assertOk()
             ->assertJsonPath('user_id', $second->id);
@@ -223,7 +227,29 @@ class ChatApiTest extends TestCase
             'low_user_id' => min($first->id, $second->id),
             'high_user_id' => max($first->id, $second->id),
         ]);
-        $this->assertDatabaseMissing('conversations', ['id' => $conversation->id]);
+        $this->assertDatabaseHas('conversations', ['id' => $conversation->id]);
+        $this->assertDatabaseHas('messages', [
+            'id' => $messageId,
+            'conversation_id' => $conversation->id,
+        ]);
+
+        $requestId = $this->postJson('/api/friends/requests', [
+            'phone' => $second->phone,
+        ])->assertCreated()->json('id');
+        Sanctum::actingAs($second);
+        $this->postJson("/api/friends/requests/{$requestId}/accept")
+            ->assertOk()
+            ->assertJsonPath('status', 'accepted');
+
+        Sanctum::actingAs($first);
+        $restoredConversation = $this->postJson('/api/conversations', [
+            'friend_id' => $second->id,
+        ])->assertCreated();
+        $this->assertSame($conversation->id, $restoredConversation->json('id'));
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()
+            ->assertJsonPath('data.0.id', $messageId)
+            ->assertJsonPath('data.0.body', 'Keep this conversation history.');
     }
 
     public function test_friends_can_accept_requests_and_send_messages_with_receipts(): void

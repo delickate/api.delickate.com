@@ -29,6 +29,8 @@ token. Include it on protected requests as `Authorization: Bearer YOUR_SANCTUM_T
 ### Friends
 
 - `GET /api/friends` — accepted friends.
+- `DELETE /api/friends/{user}` — remove a friend without deleting the direct
+  conversation or its message history; re-adding the friend restores that chat.
 - `GET /api/blocks` — users you have blocked.
 - `POST /api/users/{user}/block` and `DELETE /api/users/{user}/block` — block
   or unblock a user. Blocking hides direct chats and prevents direct messages

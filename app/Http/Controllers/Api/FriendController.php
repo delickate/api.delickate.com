@@ -3,7 +3,6 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Models\Conversation;
 use App\Models\FriendRequest;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
@@ -244,15 +243,7 @@ class FriendController extends Controller
             return response()->json(['message' => 'This user is not in your friends list.'], 404);
         }
 
-        DB::transaction(function () use ($lowId, $highId, $friendRequest) {
-            $friendRequest->delete();
-
-            Conversation::query()
-                ->where('type', 'direct')
-                ->where('low_user_id', $lowId)
-                ->where('high_user_id', $highId)
-                ->delete();
-        });
+        $friendRequest->delete();
 
         return response()->json([
             'message' => 'Friend removed.',
