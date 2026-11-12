@@ -76,6 +76,18 @@ class AuthController extends Controller
         ]);
     }
 
+    public function updateSettings(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'message_edit_minutes' => ['required', 'integer', 'in:'.implode(',', User::MESSAGE_EDIT_MINUTE_OPTIONS)],
+        ]);
+
+        $user = $request->user();
+        $user->forceFill(['message_edit_minutes' => (int) $validated['message_edit_minutes']])->save();
+
+        return response()->json(['user' => $this->userData($user)]);
+    }
+
     public function updateProfilePicture(Request $request): JsonResponse
     {
         $validated = $request->validate([
@@ -131,6 +143,7 @@ class AuthController extends Controller
             'email' => $user->email,
             'dob' => $user->dob?->toDateString(),
             'avatar_url' => $user->avatar_url,
+            'message_edit_minutes' => (int) ($user->message_edit_minutes ?? User::DEFAULT_MESSAGE_EDIT_MINUTES),
         ];
     }
 }

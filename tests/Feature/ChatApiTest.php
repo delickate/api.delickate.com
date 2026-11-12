@@ -900,6 +900,78 @@ class ChatApiTest extends TestCase
         }
     }
 
+    public function test_sender_can_edit_a_text_message_within_their_edit_window(): void
+    {
+        [$sender, $recipient, $conversation] = $this->makeConversation();
+        Sanctum::actingAs($sender);
+        $messageId = $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => 'Meet at 5'])
+            ->assertCreated()
+            ->assertJsonPath('edited_at', null)
+            ->json('id');
+
+        $this->patchJson("/api/conversations/{$conversation->id}/messages/{$messageId}", ['body' => 'Meet at 6'])
+            ->assertOk()
+            ->assertJsonPath('body', 'Meet at 6')
+            ->assertJsonPath('edited_at', fn ($value) => $value !== null);
+        $this->assertSame('Meet at 6', Message::findOrFail($messageId)->body);
+
+        Sanctum::actingAs($recipient);
+        $this->patchJson("/api/conversations/{$conversation->id}/messages/{$messageId}", ['body' => 'Hijacked'])
+            ->assertForbidden();
+
+        // The default window is 5 minutes.
+        Sanctum::actingAs($sender);
+        $this->travel(6)->minutes();
+        $this->patchJson("/api/conversations/{$conversation->id}/messages/{$messageId}", ['body' => 'Too late'])
+            ->assertForbidden()
+            ->assertJsonPath('message', 'Messages can only be edited within 5 minutes of sending.');
+        $this->assertSame('Meet at 6', Message::findOrFail($messageId)->body);
+    }
+
+    public function test_edit_window_follows_the_senders_setting(): void
+    {
+        [$sender, , $conversation] = $this->makeConversation();
+        Sanctum::actingAs($sender);
+
+        $this->patchJson('/api/user/settings', ['message_edit_minutes' => 7])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('message_edit_minutes');
+        $this->patchJson('/api/user/settings', ['message_edit_minutes' => 15])
+            ->assertOk()
+            ->assertJsonPath('user.message_edit_minutes', 15);
+
+        $messageId = $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => 'Draft'])->json('id');
+        $this->travel(10)->minutes();
+        $this->patchJson("/api/conversations/{$conversation->id}/messages/{$messageId}", ['body' => 'Final'])
+            ->assertOk()
+            ->assertJsonPath('body', 'Final');
+
+        $this->patchJson('/api/user/settings', ['message_edit_minutes' => 0])->assertOk();
+        $this->patchJson("/api/conversations/{$conversation->id}/messages/{$messageId}", ['body' => 'Again'])
+            ->assertForbidden()
+            ->assertJsonPath('message', 'Message editing is turned off in your settings.');
+    }
+
+    public function test_only_live_text_messages_can_be_edited(): void
+    {
+        Storage::fake('private');
+        [$sender, , $conversation] = $this->makeConversation();
+        Sanctum::actingAs($sender);
+
+        $fileMessageId = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'attachment' => UploadedFile::fake()->createWithContent('notes.txt', 'hello'),
+        ])->json('id');
+        $this->patchJson("/api/conversations/{$conversation->id}/messages/{$fileMessageId}", ['body' => 'x'])
+            ->assertUnprocessable();
+
+        $textId = $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => 'Oops'])->json('id');
+        $this->patchJson("/api/conversations/{$conversation->id}/messages/{$textId}", ['body' => '   '])
+            ->assertUnprocessable();
+        $this->deleteJson("/api/conversations/{$conversation->id}/messages/{$textId}", ['scope' => 'everyone'])->assertOk();
+        $this->patchJson("/api/conversations/{$conversation->id}/messages/{$textId}", ['body' => 'Back'])
+            ->assertUnprocessable();
+    }
+
     public function test_voice_messages_are_validated(): void
     {
         Storage::fake('private');

@@ -632,6 +632,62 @@ class ConversationController extends Controller
         return response()->json($this->messageData($forwardedMessage, $userId), 201);
     }
 
+    /**
+     * Senders may correct their own text messages for a limited time after
+     * sending; the window is the sender's own message_edit_minutes setting.
+     */
+    public function editMessage(Request $request, Conversation $conversation, Message $message): JsonResponse
+    {
+        $user = $request->user();
+        $userId = (int) $user->id;
+        if (! $this->userIsParticipant($conversation, $userId)
+            || (int) $message->conversation_id !== (int) $conversation->id
+            || $message->hiddenFromUsers()->where('users.id', $userId)->exists()) {
+            return response()->json(['message' => 'Message not found.'], 404);
+        }
+        if ($conversation->type !== 'group' &&
+            $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
+            return response()->json(['message' => 'This direct conversation is unavailable.'], 404);
+        }
+        if ((int) $message->sender_id !== $userId) {
+            return response()->json(['message' => 'You can only edit your own messages.'], 403);
+        }
+        if ($message->type !== 'text' || $message->deleted_for_everyone_at) {
+            return response()->json(['message' => 'Only text messages can be edited.'], 422);
+        }
+
+        $minutes = (int) ($user->message_edit_minutes ?? User::DEFAULT_MESSAGE_EDIT_MINUTES);
+        if ($minutes === 0) {
+            return response()->json(['message' => 'Message editing is turned off in your settings.'], 403);
+        }
+        if ($message->created_at->lt(now()->subMinutes($minutes))) {
+            return response()->json([
+                'message' => "Messages can only be edited within {$minutes} ".($minutes === 1 ? 'minute' : 'minutes').' of sending.',
+            ], 403);
+        }
+
+        $validated = $request->validate([
+            'body' => ['required', 'string', 'max:10000'],
+        ]);
+        $body = trim($validated['body']);
+        if ($body === '') {
+            throw ValidationException::withMessages(['body' => ['The message cannot be empty.']]);
+        }
+
+        if ($body !== $message->body) {
+            $message->forceFill(['body' => $body, 'edited_at' => now()])->save();
+            $conversation->touch();
+        }
+
+        $message->load([
+            'sender:id,name,phone,profile_picture_path',
+            'replyTo.sender:id,name,profile_picture_path',
+            'replyTo.hiddenFromUsers' => fn ($query) => $query->where('users.id', $userId),
+        ]);
+
+        return response()->json($this->messageData($message, $userId));
+    }
+
     public function deleteMessage(Request $request, Conversation $conversation, Message $message): JsonResponse
     {
         $userId = (int) $request->user()->id;
@@ -827,6 +883,7 @@ class ConversationController extends Controller
                 ])
                 : null,
             'deleted_for_everyone_at' => $message->deleted_for_everyone_at,
+            'edited_at' => $message->edited_at,
             'attachment' => $message->attachment_path ? [
                 'name' => $message->attachment_name,
                 'mime' => $message->attachment_mime,

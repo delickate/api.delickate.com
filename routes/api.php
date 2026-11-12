@@ -36,6 +36,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/auth/socket-identity', [AuthController::class, 'socketIdentity']);
     Route::get('/user', fn (Request $request) => $request->user());
     Route::post('/user/profile-picture', [AuthController::class, 'updateProfilePicture']);
+    Route::patch('/user/settings', [AuthController::class, 'updateSettings']);
 
     Route::get('/friends', [FriendController::class, 'index']);
     Route::get('/blocks', [FriendController::class, 'blockedUsers']);
@@ -59,6 +60,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/conversations/{conversation}/messages', [ConversationController::class, 'send']);
     Route::post('/conversations/{conversation}/calls', [ConversationController::class, 'recordCall']);
     Route::post('/conversations/{conversation}/messages/{message}/forward', [ConversationController::class, 'forward']);
+    Route::patch('/conversations/{conversation}/messages/{message}', [ConversationController::class, 'editMessage']);
     Route::delete('/conversations/{conversation}/messages/{message}', [ConversationController::class, 'deleteMessage']);
     Route::get('/conversations/{conversation}/messages/{message}/attachment', [ConversationController::class, 'downloadAttachment']);
     Route::post('/conversations/{conversation}/delivered', [ConversationController::class, 'markDelivered']);
