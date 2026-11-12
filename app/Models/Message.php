@@ -28,6 +28,7 @@ class Message extends Model
         'read_at',
         'deleted_for_everyone_at',
         'edited_at',
+        'key_version',
     ];
 
     protected $casts = [
@@ -38,6 +39,7 @@ class Message extends Model
         'voice_duration_seconds' => 'integer',
         'deleted_for_everyone_at' => 'datetime',
         'edited_at' => 'datetime',
+        'key_version' => 'integer',
     ];
 
     public function setBodyAttribute($value): void

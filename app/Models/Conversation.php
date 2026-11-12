@@ -22,6 +22,11 @@ class Conversation extends Model
         return $this->hasMany(Message::class);
     }
 
+    public function keys(): HasMany
+    {
+        return $this->hasMany(ConversationKey::class);
+    }
+
     public function participants(): BelongsToMany
     {
         return $this->belongsToMany(User::class, 'conversation_users')

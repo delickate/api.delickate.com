@@ -972,6 +972,172 @@ class ChatApiTest extends TestCase
             ->assertUnprocessable();
     }
 
+    public function test_members_receive_the_same_conversation_key_and_it_is_not_stored_in_plain_form(): void
+    {
+        [$first, $second, $conversation] = $this->makeConversation();
+
+        Sanctum::actingAs($first);
+        $firstKeys = $this->getJson('/api/conversation-keys')->assertOk()->json('data');
+        $this->assertCount(1, $firstKeys);
+        $this->assertSame($conversation->id, $firstKeys[0]['conversation_id']);
+        $this->assertSame(1, $firstKeys[0]['version']);
+        $this->assertSame(32, strlen(base64_decode($firstKeys[0]['key'], true)));
+
+        // A new sign-in (any device) gets the same key automatically.
+        Sanctum::actingAs($second);
+        $this->getJson("/api/conversations/{$conversation->id}/keys")
+            ->assertOk()
+            ->assertJsonPath('data.0.key', $firstKeys[0]['key']);
+
+        $stored = \DB::table('conversation_keys')->value('key_material');
+        $this->assertStringNotContainsString($firstKeys[0]['key'], $stored);
+
+        Sanctum::actingAs(User::factory()->create());
+        $this->getJson("/api/conversations/{$conversation->id}/keys")->assertNotFound();
+    }
+
+    public function test_encrypted_messages_files_and_voice_notes_are_stored_as_ciphertext(): void
+    {
+        Storage::fake('private');
+        [$sender, $recipient, $conversation] = $this->makeConversation();
+        Sanctum::actingAs($sender);
+        $this->getJson("/api/conversations/{$conversation->id}/keys")->assertOk();
+        $envelope = $this->encryptedEnvelope();
+
+        $text = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => $envelope, 'encrypted' => true, 'key_version' => 1,
+        ])->assertCreated()
+            ->assertJsonPath('encrypted', true)
+            ->assertJsonPath('key_version', 1)
+            ->assertJsonPath('body', $envelope);
+
+        // Encrypted uploads are random-looking bytes the server cannot inspect.
+        $file = $this->post("/api/conversations/{$conversation->id}/messages", [
+            'body' => $this->encryptedEnvelope(), 'encrypted' => '1', 'key_version' => 1,
+            'attachment' => UploadedFile::fake()->createWithContent('blob', random_bytes(300)),
+        ], ['Accept' => 'application/json'])->assertCreated()
+            ->assertJsonPath('type', 'file')
+            ->assertJsonPath('attachment.encrypted', true)
+            ->assertJsonPath('attachment.name', 'encrypted.bin');
+        $this->assertStringEndsWith('.bin', Message::findOrFail($file->json('id'))->attachment_path);
+
+        $this->post("/api/conversations/{$conversation->id}/messages", [
+            'body' => $this->encryptedEnvelope(), 'encrypted' => '1', 'key_version' => 1,
+            'voice' => UploadedFile::fake()->createWithContent('blob', random_bytes(300)),
+            'voice_duration_seconds' => 4,
+        ], ['Accept' => 'application/json'])->assertCreated()
+            ->assertJsonPath('type', 'voice')
+            ->assertJsonPath('voice.duration_seconds', 4);
+
+        $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => 'plain text pretending', 'encrypted' => true, 'key_version' => 1,
+        ])->assertUnprocessable()->assertJsonValidationErrors('body');
+        $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => $this->encryptedEnvelope(), 'encrypted' => true, 'key_version' => 9,
+        ])->assertUnprocessable()->assertJsonValidationErrors('key_version');
+
+        Sanctum::actingAs($recipient);
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()
+            ->assertJsonPath('data.2.body', $envelope)
+            ->assertJsonPath('data.2.encrypted', true);
+
+        // Edits and forwards of encrypted messages must stay encrypted.
+        Sanctum::actingAs($sender);
+        $this->patchJson("/api/conversations/{$conversation->id}/messages/{$text->json('id')}", ['body' => 'plain edit'])
+            ->assertUnprocessable();
+        $this->patchJson("/api/conversations/{$conversation->id}/messages/{$text->json('id')}", [
+            'body' => $this->encryptedEnvelope(), 'encrypted' => true, 'key_version' => 1,
+        ])->assertOk()->assertJsonPath('encrypted', true);
+
+        $other = Conversation::create([
+            'low_user_id' => min($sender->id, $third = User::factory()->create()->id),
+            'high_user_id' => max($sender->id, $third),
+        ]);
+        $this->getJson("/api/conversations/{$other->id}/keys")->assertOk();
+        $this->postJson("/api/conversations/{$conversation->id}/messages/{$text->json('id')}/forward", [
+            'target_conversation_id' => $other->id,
+        ])->assertUnprocessable();
+        $this->postJson("/api/conversations/{$conversation->id}/messages/{$text->json('id')}/forward", [
+            'target_conversation_id' => $other->id,
+            'encrypted' => true, 'key_version' => 1, 'body' => $this->encryptedEnvelope(),
+        ])->assertCreated()->assertJsonPath('encrypted', true)->assertJsonPath('conversation_id', $other->id);
+    }
+
+    public function test_leaving_or_removal_from_a_group_rotates_its_key(): void
+    {
+        $owner = User::factory()->create();
+        $member = User::factory()->create();
+        $leaver = User::factory()->create();
+        $group = Conversation::create(['type' => 'group', 'name' => 'Team', 'created_by_user_id' => $owner->id]);
+        $group->participants()->attach([$owner->id, $member->id, $leaver->id]);
+
+        Sanctum::actingAs($leaver);
+        $this->getJson("/api/conversations/{$group->id}/keys")->assertOk()->assertJsonCount(1, 'data');
+        $this->postJson("/api/groups/{$group->id}/leave")->assertOk();
+        $this->getJson("/api/conversations/{$group->id}/keys")->assertNotFound();
+
+        Sanctum::actingAs($owner);
+        $this->deleteJson("/api/groups/{$group->id}/members/{$member->id}")->assertOk();
+        $this->getJson("/api/conversations/{$group->id}/keys")
+            ->assertOk()
+            ->assertJsonCount(3, 'data')
+            ->assertJsonPath('data.2.version', 3);
+
+        // Old keys are refused for new messages; the latest one works.
+        $this->postJson("/api/conversations/{$group->id}/messages", [
+            'body' => $this->encryptedEnvelope(), 'encrypted' => true, 'key_version' => 1,
+        ])->assertUnprocessable()->assertJsonValidationErrors('key_version');
+        $this->postJson("/api/conversations/{$group->id}/messages", [
+            'body' => $this->encryptedEnvelope(), 'encrypted' => true, 'key_version' => 3,
+        ])->assertCreated();
+    }
+
+    private function encryptedEnvelope(): string
+    {
+        return json_encode([
+            'v' => 1,
+            'iv' => base64_encode(random_bytes(12)),
+            'ct' => base64_encode(random_bytes(40)),
+        ]);
+    }
+
+    public function test_messages_report_who_has_read_how_far_in_a_group(): void
+    {
+        $owner = User::factory()->create();
+        $reader = User::factory()->create();
+        $other = User::factory()->create();
+        $group = Conversation::create(['type' => 'group', 'name' => 'Team', 'created_by_user_id' => $owner->id]);
+        $group->participants()->attach([$owner->id, $reader->id, $other->id]);
+
+        Sanctum::actingAs($owner);
+        $first = $this->postJson("/api/conversations/{$group->id}/messages", ['body' => 'one'])->json('id');
+        $this->getJson("/api/conversations/{$group->id}/messages")->assertOk()->assertJsonCount(0, 'read_cursors');
+
+        Sanctum::actingAs($reader);
+        $this->postJson("/api/conversations/{$group->id}/read")->assertOk();
+
+        Sanctum::actingAs($owner);
+        $second = $this->postJson("/api/conversations/{$group->id}/messages", ['body' => 'two'])->json('id');
+        $response = $this->getJson("/api/conversations/{$group->id}/messages")
+            ->assertOk()
+            ->assertJsonCount(2, 'data')
+            ->assertJsonCount(1, 'read_cursors')
+            ->assertJsonPath('read_cursors.0.user.id', $reader->id)
+            ->assertJsonPath('read_cursors.0.user.name', $reader->name)
+            ->assertJsonPath('read_cursors.0.last_read_message_id', $first);
+        $this->assertNotNull($response->json('read_cursors.0.read_at'));
+
+        // Reading again moves the position forward; a third member's read is listed too.
+        Sanctum::actingAs($reader);
+        $this->postJson("/api/conversations/{$group->id}/read")->assertOk();
+        Sanctum::actingAs($other);
+        $this->postJson("/api/conversations/{$group->id}/read")->assertOk();
+        $cursors = collect($this->getJson("/api/conversations/{$group->id}/messages")->json('read_cursors'))
+            ->pluck('last_read_message_id', 'user.id');
+        $this->assertSame([$reader->id => $second, $other->id => $second], $cursors->sortKeys()->all());
+    }
+
     public function test_voice_messages_are_validated(): void
     {
         Storage::fake('private');

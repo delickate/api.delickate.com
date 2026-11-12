@@ -49,6 +49,8 @@ Route::middleware('auth:sanctum')->group(function () {
         ->whereIn('action', ['accept', 'reject']);
 
     Route::get('/conversations', [ConversationController::class, 'index']);
+    Route::get('/conversation-keys', [ConversationController::class, 'allKeys']);
+    Route::get('/conversations/{conversation}/keys', [ConversationController::class, 'keys']);
     Route::get('/call-history', [ConversationController::class, 'callHistory']);
     Route::post('/groups', [ConversationController::class, 'createGroup']);
     Route::post('/groups/{conversation}/members', [ConversationController::class, 'addMember']);

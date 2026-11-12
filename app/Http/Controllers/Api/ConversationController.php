@@ -7,6 +7,7 @@ use App\Models\Conversation;
 use App\Models\FriendRequest;
 use App\Models\Message;
 use App\Models\User;
+use App\Support\ConversationKeys;
 use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -257,6 +258,8 @@ class ConversationController extends Controller
         }
 
         $conversation->participants()->detach($userId);
+        // Whoever left must not be able to read anything sent from now on.
+        ConversationKeys::rotate($conversation);
 
         return response()->json([
             'message' => 'You left the group.',
@@ -290,11 +293,55 @@ class ConversationController extends Controller
         }
 
         $conversation->participants()->detach($user->id);
+        // Whoever left must not be able to read anything sent from now on.
+        ConversationKeys::rotate($conversation);
 
         return response()->json([
             'message' => 'Member removed from group.',
             'conversation_id' => $conversation->id,
             'removed_user_id' => $user->id,
+        ]);
+    }
+
+    /**
+     * Keys for every conversation the user belongs to, so a newly signed-in
+     * device can read its chats straight away.
+     */
+    public function allKeys(Request $request): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        $conversations = Conversation::query()
+            ->where(fn ($query) => $query
+                ->where(fn ($direct) => $direct
+                    ->where('type', 'direct')
+                    ->where(fn ($pair) => $pair->where('low_user_id', $userId)->orWhere('high_user_id', $userId)))
+                ->orWhere(fn ($group) => $group
+                    ->where('type', 'group')
+                    ->whereHas('participants', fn ($members) => $members->whereKey($userId))))
+            ->get();
+
+        $keys = $conversations->flatMap(fn (Conversation $conversation) => ConversationKeys::ensure($conversation))
+            ->map(fn ($key) => ConversationKeys::payload($key))
+            ->values();
+
+        return response()->json(['data' => $keys]);
+    }
+
+    public function keys(Request $request, Conversation $conversation): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        if (! $this->userIsParticipant($conversation, $userId)) {
+            return response()->json(['message' => 'Conversation not found.'], 404);
+        }
+        if ($conversation->type !== 'group' &&
+            $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
+            return response()->json(['message' => 'This direct conversation is unavailable.'], 404);
+        }
+
+        return response()->json([
+            'data' => ConversationKeys::ensure($conversation)
+                ->map(fn ($key) => ConversationKeys::payload($key))
+                ->values(),
         ]);
     }
 
@@ -352,7 +399,24 @@ class ConversationController extends Controller
             ->paginate(50);
         $messages->getCollection()->transform(fn (Message $message) => $this->messageData($message, $userId));
 
-        return response()->json($messages);
+        // Each member's read position, so apps can show who has seen which message.
+        $memberIds = $conversation->type === 'group'
+            ? $conversation->participants()->pluck('users.id')->map(fn ($id) => (int) $id)->all()
+            : [(int) $conversation->low_user_id, (int) $conversation->high_user_id];
+        $readCursors = DB::table('conversation_reads')
+            ->where('conversation_id', $conversation->id)
+            ->whereIn('user_id', $memberIds)
+            ->get(['user_id', 'last_read_message_id', 'read_at']);
+        $readers = User::query()->whereKey($readCursors->pluck('user_id'))->get()->keyBy('id');
+
+        return response()->json([
+            ...$messages->toArray(),
+            'read_cursors' => $readCursors->map(fn ($cursor) => [
+                'user' => $this->publicUser($readers->get($cursor->user_id)),
+                'last_read_message_id' => (int) $cursor->last_read_message_id,
+                'read_at' => \Illuminate\Support\Carbon::parse($cursor->read_at)->toISOString(),
+            ])->filter(fn ($cursor) => $cursor['user'] !== null)->values(),
+        ]);
     }
 
     public function callHistory(Request $request): JsonResponse
@@ -486,11 +550,30 @@ class ConversationController extends Controller
             'body' => ['required_without_all:attachment,voice', 'nullable', 'string', 'max:10000'],
             // The allowed types and their content checks live in attachmentTypes().
             'attachment' => ['required_without_all:body,voice', 'nullable', 'file', 'max:5120'],
-            'voice' => ['nullable', 'file', 'max:5120', 'prohibits:attachment,body'],
+            'voice' => ['nullable', 'file', 'max:5120', 'prohibits:attachment'],
             'voice_duration_seconds' => ['required_with:voice', 'nullable', 'integer', 'min:1', 'max:'.self::MAX_VOICE_SECONDS],
             'type' => ['sometimes', 'in:text,protected'],
             'reply_to_message_id' => ['sometimes', 'nullable', 'integer', 'exists:messages,id'],
+            'encrypted' => ['sometimes', 'boolean'],
+            'key_version' => ['exclude_unless:encrypted,true,1', 'required', 'integer', 'min:1'],
         ]);
+        $encrypted = filter_var($validated['encrypted'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        // Plain voice notes cannot carry a caption; encrypted ones carry their key in the body.
+        if ($request->hasFile('voice') && ! $encrypted && filled($validated['body'] ?? null)) {
+            throw ValidationException::withMessages([
+                'voice' => ['The voice field prohibits body from being present.'],
+            ]);
+        }
+        if ($encrypted) {
+            if (($validated['type'] ?? 'text') === 'protected') {
+                throw ValidationException::withMessages([
+                    'type' => ['Protected messages are already encrypted with their own password.'],
+                ]);
+            }
+            // Encrypted messages always carry a body: it holds the text and, for
+            // files and voice notes, the file's own key and real name.
+            $this->validatedEncryptedBody($conversation, $validated['body'] ?? null, (int) $validated['key_version']);
+        }
         $replyToId = $validated['reply_to_message_id'] ?? null;
         if ($replyToId !== null && (int) Message::query()->whereKey($replyToId)->value('conversation_id') !== (int) $conversation->id) {
             throw ValidationException::withMessages([
@@ -500,9 +583,14 @@ class ConversationController extends Controller
 
         $voice = $request->file('voice');
         $file = $voice ?? $request->file('attachment');
-        $attachment = $voice
-            ? $this->validatedVoice($voice)
-            : ($file ? $this->validatedAttachment($file) : null);
+        // Encrypted uploads are opaque to the server, so their content cannot be
+        // checked here; the recipient's app checks the type after decrypting.
+        $attachment = match (true) {
+            $file && $encrypted => ['name' => 'encrypted.bin', 'mime' => 'application/octet-stream'],
+            (bool) $voice => $this->validatedVoice($voice),
+            (bool) $file => $this->validatedAttachment($file),
+            default => null,
+        };
         $type = $voice ? 'voice' : ($file ? 'file' : 'text');
         if (($validated['type'] ?? 'text') === 'protected') {
             if ($file) {
@@ -516,11 +604,12 @@ class ConversationController extends Controller
         $storedPath = null;
 
         try {
-            $message = DB::transaction(function () use ($conversation, $userId, $validated, $file, $attachment, $type, $replyToId, &$storedPath) {
+            $message = DB::transaction(function () use ($conversation, $userId, $validated, $file, $attachment, $type, $replyToId, $encrypted, &$storedPath) {
                 $message = $conversation->messages()->create([
                     'sender_id' => $userId,
                     'reply_to_message_id' => $replyToId,
-                    'body' => $type === 'voice' ? null : ($validated['body'] ?? null),
+                    'key_version' => $encrypted ? (int) $validated['key_version'] : null,
+                    'body' => $type === 'voice' && ! $encrypted ? null : ($validated['body'] ?? null),
                     'type' => $type,
                     'attachment_name' => $attachment['name'] ?? null,
                     'attachment_mime' => $attachment['mime'] ?? null,
@@ -577,7 +666,11 @@ class ConversationController extends Controller
 
         $validated = $request->validate([
             'target_conversation_id' => ['required', 'integer', 'exists:conversations,id'],
+            'encrypted' => ['sometimes', 'boolean'],
+            'body' => ['exclude_unless:encrypted,true,1', 'required', 'string', 'max:10000'],
+            'key_version' => ['exclude_unless:encrypted,true,1', 'required', 'integer', 'min:1'],
         ]);
+        $encrypted = filter_var($validated['encrypted'] ?? false, FILTER_VALIDATE_BOOLEAN);
         $targetConversation = Conversation::findOrFail($validated['target_conversation_id']);
         if (! $this->userIsParticipant($targetConversation, $userId)) {
             return response()->json(['message' => 'Target conversation not found.'], 404);
@@ -592,9 +685,20 @@ class ConversationController extends Controller
             ]);
         }
 
+        // The server cannot read encrypted messages, so the forwarding app sends the
+        // content re-encrypted with the target conversation's key.
+        if ($message->key_version !== null && ! $encrypted) {
+            throw ValidationException::withMessages([
+                'body' => ['Encrypted messages must be re-encrypted for the conversation they are forwarded to.'],
+            ]);
+        }
+        if ($encrypted) {
+            $this->validatedEncryptedBody($targetConversation, $validated['body'], (int) $validated['key_version']);
+        }
+
         $copiedPath = null;
         try {
-            $forwardedMessage = DB::transaction(function () use ($message, $targetConversation, $userId, &$copiedPath) {
+            $forwardedMessage = DB::transaction(function () use ($message, $targetConversation, $userId, $encrypted, $validated, &$copiedPath) {
                 if ($message->attachment_path) {
                     $extension = pathinfo($message->attachment_name, PATHINFO_EXTENSION);
                     $copiedPath = "messages/{$targetConversation->id}/forwarded-".Str::uuid()
@@ -606,7 +710,8 @@ class ConversationController extends Controller
 
                 $forwardedMessage = $targetConversation->messages()->create([
                     'sender_id' => $userId,
-                    'body' => $message->body,
+                    'key_version' => $encrypted ? (int) $validated['key_version'] : null,
+                    'body' => $encrypted ? $validated['body'] : $message->body,
                     'type' => $message->type,
                     'attachment_path' => $copiedPath,
                     'attachment_name' => $message->attachment_name,
@@ -668,14 +773,29 @@ class ConversationController extends Controller
 
         $validated = $request->validate([
             'body' => ['required', 'string', 'max:10000'],
+            'encrypted' => ['sometimes', 'boolean'],
+            'key_version' => ['exclude_unless:encrypted,true,1', 'required', 'integer', 'min:1'],
         ]);
+        $encrypted = filter_var($validated['encrypted'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        if ($message->key_version !== null && ! $encrypted) {
+            throw ValidationException::withMessages([
+                'body' => ['This message is encrypted, so its edit must be encrypted too.'],
+            ]);
+        }
         $body = trim($validated['body']);
         if ($body === '') {
             throw ValidationException::withMessages(['body' => ['The message cannot be empty.']]);
         }
+        if ($encrypted) {
+            $this->validatedEncryptedBody($conversation, $body, (int) $validated['key_version']);
+        }
 
         if ($body !== $message->body) {
-            $message->forceFill(['body' => $body, 'edited_at' => now()])->save();
+            $message->forceFill([
+                'body' => $body,
+                'key_version' => $encrypted ? (int) $validated['key_version'] : null,
+                'edited_at' => now(),
+            ])->save();
             $conversation->touch();
         }
 
@@ -794,6 +914,32 @@ class ConversationController extends Controller
                     ->whereNull('read_at')
                     ->update(['read_at' => $now, 'updated_at' => $now]);
 
+                // Move this person's read position to the newest message, so others
+                // can see exactly who has read what (also in groups).
+                $latestId = $conversation->messages()->max('id');
+                if ($latestId) {
+                    $existing = DB::table('conversation_reads')
+                        ->where('conversation_id', $conversation->id)
+                        ->where('user_id', $userId)
+                        ->first();
+                    if (! $existing) {
+                        DB::table('conversation_reads')->insert([
+                            'conversation_id' => $conversation->id,
+                            'user_id' => $userId,
+                            'last_read_message_id' => $latestId,
+                            'read_at' => $now,
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ]);
+                    } elseif ($existing->last_read_message_id < $latestId) {
+                        DB::table('conversation_reads')->where('id', $existing->id)->update([
+                            'last_read_message_id' => $latestId,
+                            'read_at' => $now,
+                            'updated_at' => $now,
+                        ]);
+                    }
+                }
+
                 return [$updated, $now];
             });
         } else {
@@ -876,6 +1022,7 @@ class ConversationController extends Controller
                         'name' => $reply->sender->name,
                     ],
                     'body' => $reply->type === 'protected' ? null : $reply->body,
+                    'key_version' => $reply->key_version,
                     'type' => $reply->type,
                     'attachment' => $reply->attachment_path ? ['name' => $reply->attachment_name] : null,
                     'deleted_for_everyone_at' => $reply->deleted_for_everyone_at,
@@ -884,10 +1031,15 @@ class ConversationController extends Controller
                 : null,
             'deleted_for_everyone_at' => $message->deleted_for_everyone_at,
             'edited_at' => $message->edited_at,
+            // Encrypted messages: body is ciphertext, and the real attachment name
+            // and type are inside it; clients decrypt with the conversation key.
+            'encrypted' => $message->key_version !== null,
+            'key_version' => $message->key_version,
             'attachment' => $message->attachment_path ? [
                 'name' => $message->attachment_name,
                 'mime' => $message->attachment_mime,
                 'size' => $message->attachment_size,
+                'encrypted' => $message->key_version !== null,
             ] : null,
             'is_forwarded' => (bool) $message->is_forwarded,
             'voice' => $message->type === 'voice' && $message->attachment_path ? [
@@ -1128,6 +1280,36 @@ class ConversationController extends Controller
             return (bool) $check($zip);
         } finally {
             $zip->close();
+        }
+    }
+
+    /**
+     * Checks that an encrypted body is a well-formed envelope for an existing
+     * key version of the conversation. The content itself cannot be checked.
+     */
+    private function validatedEncryptedBody(Conversation $conversation, ?string $body, int $keyVersion): void
+    {
+        $envelope = is_string($body) ? json_decode($body, true) : null;
+        $decodedLength = fn ($value) => is_string($value) && preg_match('/^[A-Za-z0-9+\/]+={0,2}$/', $value)
+            ? strlen((string) base64_decode($value, true))
+            : -1;
+
+        $valid = is_array($envelope)
+            && array_keys($envelope) === ['v', 'iv', 'ct']
+            && $envelope['v'] === 1
+            && $decodedLength($envelope['iv']) === 12
+            && $decodedLength($envelope['ct']) > 16;
+        if (! $valid) {
+            throw ValidationException::withMessages([
+                'body' => ['The message is not a valid encrypted envelope.'],
+            ]);
+        }
+        // Only the newest key is accepted, so nobody who has left a group can read
+        // new messages through an app that has not refreshed its keys yet.
+        if ($keyVersion !== ConversationKeys::latestVersion($conversation)) {
+            throw ValidationException::withMessages([
+                'key_version' => ['This conversation has a newer encryption key. Refresh and try again.'],
+            ]);
         }
     }
 
