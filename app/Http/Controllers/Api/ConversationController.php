@@ -53,9 +53,17 @@ class ConversationController extends Controller
                     ->limit(1),
             ])
             ->withCount([
+                // Unread means newer than this person's own read position. (A
+                // message's read_at is set by whoever reads it first, so in a
+                // group it cannot tell whether *this* member has read it.)
                 'messages as unread_count' => fn ($query) => $query
                     ->where('sender_id', '!=', $userId)
-                    ->whereNull('read_at')
+                    ->whereRaw(
+                        'messages.id > COALESCE((SELECT conversation_reads.last_read_message_id FROM conversation_reads'
+                        .' WHERE conversation_reads.conversation_id = messages.conversation_id'
+                        .' AND conversation_reads.user_id = ?), 0)',
+                        [$userId]
+                    )
                     ->whereNull('deleted_for_everyone_at')
                     ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId)),
             ])
@@ -236,6 +244,19 @@ class ConversationController extends Controller
         }
 
         $conversation->participants()->syncWithoutDetaching([$memberId]);
+        // A new member starts with the history already "read", so they are not
+        // shown every old message as unread.
+        $latestMessageId = $conversation->messages()->max('id');
+        if ($latestMessageId) {
+            DB::table('conversation_reads')->insertOrIgnore([
+                'conversation_id' => $conversation->id,
+                'user_id' => $memberId,
+                'last_read_message_id' => $latestMessageId,
+                'read_at' => now(),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+        }
         $member = User::query()->select(['id', 'name', 'phone', 'profile_picture_path'])->findOrFail($memberId);
 
         return response()->json([
@@ -388,16 +409,35 @@ class ConversationController extends Controller
             return response()->json(['message' => 'This direct conversation is unavailable.'], 404);
         }
 
-        $messages = $conversation->messages()
+        $validated = $request->validate([
+            // Cursor paging: messages older than this id (for "load earlier messages").
+            'before_id' => ['sometimes', 'integer', 'min:1'],
+            'limit' => ['sometimes', 'integer', 'min:1', 'max:100'],
+        ]);
+        $limit = (int) ($validated['limit'] ?? 50);
+
+        $query = $conversation->messages()
             ->whereDoesntHave('hiddenFromUsers', fn ($query) => $query->where('users.id', $userId))
             ->with([
                 'sender:id,name,phone,profile_picture_path',
                 'replyTo.sender:id,name,profile_picture_path',
                 'replyTo.hiddenFromUsers' => fn ($query) => $query->where('users.id', $userId),
             ])
-            ->orderByDesc('id')
-            ->paginate(50);
-        $messages->getCollection()->transform(fn (Message $message) => $this->messageData($message, $userId));
+            ->orderByDesc('id');
+
+        if (isset($validated['before_id'])) {
+            // Fetch one extra row to know whether even older messages exist.
+            $rows = $query->where('id', '<', (int) $validated['before_id'])->limit($limit + 1)->get();
+            $page = [
+                'data' => $rows->take($limit)->map(fn (Message $message) => $this->messageData($message, $userId))->values(),
+                'has_more' => $rows->count() > $limit,
+            ];
+        } else {
+            // Newest messages; the paginator shape is kept for existing clients.
+            $messages = $query->paginate($limit);
+            $messages->getCollection()->transform(fn (Message $message) => $this->messageData($message, $userId));
+            $page = [...$messages->toArray(), 'has_more' => $messages->hasMorePages()];
+        }
 
         // Each member's read position, so apps can show who has seen which message.
         $memberIds = $conversation->type === 'group'
@@ -410,7 +450,7 @@ class ConversationController extends Controller
         $readers = User::query()->whereKey($readCursors->pluck('user_id'))->get()->keyBy('id');
 
         return response()->json([
-            ...$messages->toArray(),
+            ...$page,
             'read_cursors' => $readCursors->map(fn ($cursor) => [
                 'user' => $this->publicUser($readers->get($cursor->user_id)),
                 'last_read_message_id' => (int) $cursor->last_read_message_id,

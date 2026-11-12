@@ -1138,6 +1138,81 @@ class ChatApiTest extends TestCase
         $this->assertSame([$reader->id => $second, $other->id => $second], $cursors->sortKeys()->all());
     }
 
+    public function test_group_unread_counts_are_per_member(): void
+    {
+        $owner = User::factory()->create();
+        $fastReader = User::factory()->create();
+        $slowReader = User::factory()->create();
+        $group = Conversation::create(['type' => 'group', 'name' => 'Team', 'created_by_user_id' => $owner->id]);
+        $group->participants()->attach([$owner->id, $fastReader->id, $slowReader->id]);
+        $unreadFor = function (User $user) use ($group) {
+            Sanctum::actingAs($user);
+
+            return collect($this->getJson('/api/conversations')->json('data'))
+                ->firstWhere('id', $group->id)['unread_count'];
+        };
+
+        Sanctum::actingAs($owner);
+        $this->postJson("/api/conversations/{$group->id}/messages", ['body' => 'one'])->assertCreated();
+        $this->postJson("/api/conversations/{$group->id}/messages", ['body' => 'two'])->assertCreated();
+
+        Sanctum::actingAs($fastReader);
+        $this->postJson("/api/conversations/{$group->id}/read")->assertOk();
+
+        // One member reading must not clear the message for everyone else.
+        $this->assertSame(0, $unreadFor($fastReader));
+        $this->assertSame(2, $unreadFor($slowReader));
+        $this->assertSame(0, $unreadFor($owner));
+
+        // Someone added later does not see the old history as unread.
+        $friend = User::factory()->create();
+        FriendRequest::create([
+            'low_user_id' => min($owner->id, $friend->id),
+            'high_user_id' => max($owner->id, $friend->id),
+            'sender_id' => $owner->id,
+            'status' => 'accepted',
+        ]);
+        Sanctum::actingAs($owner);
+        $this->postJson("/api/groups/{$group->id}/members", ['user_id' => $friend->id])->assertSuccessful();
+        $this->assertSame(0, $unreadFor($friend));
+        Sanctum::actingAs($owner);
+        $this->postJson("/api/conversations/{$group->id}/messages", ['body' => 'welcome'])->assertCreated();
+        $this->assertSame(1, $unreadFor($friend));
+    }
+
+    public function test_older_messages_load_in_pages_before_a_cursor(): void
+    {
+        [$sender, $recipient, $conversation] = $this->makeConversation();
+        Sanctum::actingAs($sender);
+        $ids = [];
+        for ($index = 1; $index <= 7; $index++) {
+            $ids[] = $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => "m{$index}"])->json('id');
+        }
+
+        Sanctum::actingAs($recipient);
+        $newest = $this->getJson("/api/conversations/{$conversation->id}/messages?limit=3")
+            ->assertOk()
+            ->assertJsonPath('has_more', true)
+            ->assertJsonStructure(['data', 'current_page', 'read_cursors']);
+        $this->assertSame([$ids[6], $ids[5], $ids[4]], array_column($newest->json('data'), 'id'));
+
+        $older = $this->getJson("/api/conversations/{$conversation->id}/messages?before_id={$ids[4]}&limit=3")
+            ->assertOk()
+            ->assertJsonPath('has_more', true);
+        $this->assertSame([$ids[3], $ids[2], $ids[1]], array_column($older->json('data'), 'id'));
+
+        // A message arriving meanwhile does not shift the cursor's pages.
+        Sanctum::actingAs($sender);
+        $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => 'new'])->assertCreated();
+        Sanctum::actingAs($recipient);
+        $oldest = $this->getJson("/api/conversations/{$conversation->id}/messages?before_id={$ids[1]}&limit=3")
+            ->assertOk()
+            ->assertJsonPath('has_more', false);
+        $this->assertSame([$ids[0]], array_column($oldest->json('data'), 'id'));
+
+        $this->getJson("/api/conversations/{$conversation->id}/messages?limit=500")->assertUnprocessable();
+    }
+
     public function test_voice_messages_are_validated(): void
     {
         Storage::fake('private');
