@@ -709,6 +709,88 @@ class ChatApiTest extends TestCase
         ])->assertUnprocessable()->assertJsonValidationErrors('attachment');
     }
 
+    public function test_office_documents_spreadsheets_and_archives_can_be_attached(): void
+    {
+        Storage::fake('private');
+        [$sender, , $conversation] = $this->makeConversation();
+        Sanctum::actingAs($sender);
+        $ole = "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1".str_repeat("\0", 504);
+        $files = [
+            'report.docx' => [$this->zipBytes(['[Content_Types].xml' => '<Types/>', 'word/document.xml' => '<w:document/>']),
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+            'budget.xlsx' => [$this->zipBytes(['[Content_Types].xml' => '<Types/>', 'xl/workbook.xml' => '<workbook/>']),
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+            'slides.pptx' => [$this->zipBytes(['[Content_Types].xml' => '<Types/>', 'ppt/presentation.xml' => '<p/>']),
+                'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+            'notes.odt' => [$this->zipBytes(['mimetype' => 'application/vnd.oasis.opendocument.text', 'content.xml' => '<x/>']),
+                'application/vnd.oasis.opendocument.text'],
+            'bundle.zip' => [$this->zipBytes(['readme.txt' => 'hello']), 'application/zip'],
+            'legacy.doc' => [$ole, 'application/msword'],
+            'legacy.xls' => [$ole, 'application/vnd.ms-excel'],
+            'letter.rtf' => ["{\\rtf1\\ansi Hello}", 'application/rtf'],
+            'contacts.csv' => ["name,phone\nAli,+923001234567\n", 'text/csv'],
+        ];
+
+        foreach ($files as $name => [$contents, $mime]) {
+            $response = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+                'attachment' => UploadedFile::fake()->createWithContent($name, $contents),
+            ]);
+            $response->assertCreated()
+                ->assertJsonPath('attachment.name', $name)
+                ->assertJsonPath('attachment.mime', $mime);
+
+            $stored = Message::findOrFail($response->json('id'))->attachment_path;
+            $this->assertSame(pathinfo($name, PATHINFO_EXTENSION), pathinfo($stored, PATHINFO_EXTENSION));
+        }
+
+        $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'attachment' => UploadedFile::fake()->image('photo.bmp'),
+        ])->assertCreated()->assertJsonPath('attachment.mime', 'image/bmp');
+    }
+
+    public function test_disguised_and_unsupported_attachments_are_rejected(): void
+    {
+        Storage::fake('private');
+        [$sender, , $conversation] = $this->makeConversation();
+        Sanctum::actingAs($sender);
+
+        foreach ([
+            // A plain ZIP is not a Word document.
+            'fake.docx' => $this->zipBytes(['readme.txt' => 'hello']),
+            // A Word package is not a spreadsheet.
+            'fake.xlsx' => $this->zipBytes(['[Content_Types].xml' => '<Types/>', 'word/document.xml' => '<w/>']),
+            'fake.odt' => $this->zipBytes(['mimetype' => 'application/vnd.oasis.opendocument.spreadsheet']),
+            'program.doc' => "MZ\x90\0".str_repeat("\0", 60),
+            'broken.zip' => 'PK not really a zip',
+            'binary.csv' => "a,b\n\0\0\0",
+            'tool.exe' => "MZ\x90\0".str_repeat("\0", 60),
+        ] as $name => $contents) {
+            $this->postJson("/api/conversations/{$conversation->id}/messages", [
+                'attachment' => UploadedFile::fake()->createWithContent($name, $contents),
+            ])->assertUnprocessable()->assertJsonValidationErrors('attachment');
+        }
+
+        $this->assertSame(0, Message::count());
+    }
+
+    private function zipBytes(array $entries): string
+    {
+        $path = tempnam(sys_get_temp_dir(), 'zip');
+        $zip = new \ZipArchive();
+        $zip->open($path, \ZipArchive::OVERWRITE);
+        foreach ($entries as $name => $contents) {
+            $zip->addFromString($name, $contents);
+            if ($name === 'mimetype') {
+                $zip->setCompressionName($name, \ZipArchive::CM_STORE);
+            }
+        }
+        $zip->close();
+        $bytes = file_get_contents($path);
+        unlink($path);
+
+        return $bytes;
+    }
+
     public function test_non_participant_cannot_download_an_attachment(): void
     {
         Storage::fake('private');
@@ -768,6 +850,54 @@ class ChatApiTest extends TestCase
             ->assertJsonPath('type', 'voice')
             ->assertJsonPath('voice.duration_seconds', 7)
             ->assertJsonPath('is_forwarded', true);
+    }
+
+    public function test_protected_messages_store_only_the_encrypted_envelope(): void
+    {
+        [$sender, $recipient, $conversation] = $this->makeConversation();
+        $envelope = [
+            'v' => 1,
+            'alg' => 'AES-256-GCM',
+            'kdf' => 'PBKDF2-SHA256',
+            'iter' => 600000,
+            'salt' => base64_encode(random_bytes(16)),
+            'iv' => base64_encode(random_bytes(12)),
+            'ct' => base64_encode(random_bytes(48)),
+        ];
+        Sanctum::actingAs($sender);
+
+        $sent = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'type' => 'protected',
+            'body' => json_encode($envelope),
+        ])->assertCreated()
+            ->assertJsonPath('type', 'protected')
+            ->assertJsonPath('body', null)
+            ->assertJsonPath('protected', $envelope);
+
+        $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'type' => 'text',
+            'body' => 'Re: credentials',
+            'reply_to_message_id' => $sent->json('id'),
+        ])->assertCreated()
+            ->assertJsonPath('reply_to.type', 'protected')
+            ->assertJsonPath('reply_to.body', null);
+
+        Sanctum::actingAs($recipient);
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()
+            ->assertJsonPath('data.1.protected', $envelope);
+
+        foreach ([
+            'plain text password',
+            json_encode([...$envelope, 'iv' => base64_encode(random_bytes(8))]),
+            json_encode([...$envelope, 'iter' => 10]),
+            json_encode([...$envelope, 'extra' => 'field']),
+        ] as $invalidBody) {
+            $this->postJson("/api/conversations/{$conversation->id}/messages", [
+                'type' => 'protected',
+                'body' => $invalidBody,
+            ])->assertUnprocessable()->assertJsonValidationErrors('body');
+        }
     }
 
     public function test_voice_messages_are_validated(): void

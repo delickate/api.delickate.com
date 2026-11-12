@@ -484,10 +484,11 @@ class ConversationController extends Controller
 
         $validated = $request->validate([
             'body' => ['required_without_all:attachment,voice', 'nullable', 'string', 'max:10000'],
-            'attachment' => ['required_without_all:body,voice', 'nullable', 'file', 'max:5120', 'mimes:jpg,jpeg,png,gif,webp,pdf,txt'],
+            // The allowed types and their content checks live in attachmentTypes().
+            'attachment' => ['required_without_all:body,voice', 'nullable', 'file', 'max:5120'],
             'voice' => ['nullable', 'file', 'max:5120', 'prohibits:attachment,body'],
             'voice_duration_seconds' => ['required_with:voice', 'nullable', 'integer', 'min:1', 'max:'.self::MAX_VOICE_SECONDS],
-            'type' => ['sometimes', 'in:text'],
+            'type' => ['sometimes', 'in:text,protected'],
             'reply_to_message_id' => ['sometimes', 'nullable', 'integer', 'exists:messages,id'],
         ]);
         $replyToId = $validated['reply_to_message_id'] ?? null;
@@ -503,6 +504,15 @@ class ConversationController extends Controller
             ? $this->validatedVoice($voice)
             : ($file ? $this->validatedAttachment($file) : null);
         $type = $voice ? 'voice' : ($file ? 'file' : 'text');
+        if (($validated['type'] ?? 'text') === 'protected') {
+            if ($file) {
+                throw ValidationException::withMessages([
+                    'type' => ['Protected messages cannot include attachments or voice notes.'],
+                ]);
+            }
+            $this->validatedProtectedEnvelope($validated['body'] ?? null);
+            $type = 'protected';
+        }
         $storedPath = null;
 
         try {
@@ -521,8 +531,11 @@ class ConversationController extends Controller
                 ]);
 
                 if ($file) {
-                    $storedPath = $file->store(
+                    // Name the stored file from the validated extension, never from a
+                    // content-sniffed guess (which could turn a .txt into a .php).
+                    $storedPath = $file->storeAs(
                         "messages/{$conversation->id}",
+                        Str::uuid().'.'.pathinfo($attachment['name'], PATHINFO_EXTENSION),
                         ['disk' => 'private']
                     );
                     $message->attachment_path = $storedPath;
@@ -791,8 +804,11 @@ class ConversationController extends Controller
                 'name' => $message->sender->name,
                 'avatar_url' => $message->sender->avatar_url,
             ],
-            'body' => $message->body,
+            'body' => $message->type === 'protected' ? null : $message->body,
             'type' => $message->type,
+            'protected' => $message->type === 'protected' && $message->body
+                ? json_decode($message->body, true)
+                : null,
             'reply_to' => $reply
                 ? ($replyIsHidden ? [
                     'id' => $reply->id,
@@ -803,7 +819,7 @@ class ConversationController extends Controller
                         'id' => $reply->sender->id,
                         'name' => $reply->sender->name,
                     ],
-                    'body' => $reply->body,
+                    'body' => $reply->type === 'protected' ? null : $reply->body,
                     'type' => $reply->type,
                     'attachment' => $reply->attachment_path ? ['name' => $reply->attachment_name] : null,
                     'deleted_for_everyone_at' => $reply->deleted_for_everyone_at,
@@ -869,51 +885,23 @@ class ConversationController extends Controller
     private function validatedAttachment(\Illuminate\Http\UploadedFile $file): array
     {
         $extension = strtolower($file->getClientOriginalExtension());
-        $mime = $file->getMimeType();
-        $allowed = [
-            'jpg' => ['image/jpeg', "\xFF\xD8\xFF"],
-            'jpeg' => ['image/jpeg', "\xFF\xD8\xFF"],
-            'png' => ['image/png', "\x89PNG\r\n\x1A\n"],
-            'gif' => ['image/gif', null],
-            'webp' => ['image/webp', null],
-            'pdf' => ['application/pdf', '%PDF-'],
-            'txt' => ['text/plain', null],
-        ];
+        $types = $this->attachmentTypes();
 
-        $valid = isset($allowed[$extension]) && $mime === $allowed[$extension][0];
+        if (! isset($types[$extension])) {
+            throw ValidationException::withMessages([
+                'attachment' => ['This file type is not supported. Send an image, PDF, text, Office or OpenDocument file, CSV, or ZIP.'],
+            ]);
+        }
+
         $contents = file_get_contents($file->getRealPath());
-
         if ($contents === false) {
             throw ValidationException::withMessages([
                 'attachment' => ['The attachment could not be read. Please try selecting it again.'],
             ]);
         }
 
-        if ($valid) {
-            if (in_array($extension, ['jpg', 'jpeg', 'png'], true)) {
-                $valid = str_starts_with($contents, $allowed[$extension][1]);
-            } elseif ($extension === 'gif') {
-                $valid = (str_starts_with($contents, 'GIF87a') || str_starts_with($contents, 'GIF89a'))
-                    && $this->hasImageType($file, IMAGETYPE_GIF);
-            } elseif ($extension === 'webp') {
-                $valid = strlen($contents) >= 12
-                    && substr($contents, 0, 4) === 'RIFF'
-                    && substr($contents, 8, 4) === 'WEBP'
-                    && $this->hasImageType($file, IMAGETYPE_WEBP);
-            } elseif ($extension === 'pdf') {
-                $valid = str_starts_with($contents, $allowed[$extension][1]);
-            } elseif ($extension === 'txt') {
-                $valid = ! str_contains($contents, "\0") && preg_match('//u', $contents) === 1;
-            }
-
-            if (in_array($extension, ['jpg', 'jpeg'], true)) {
-                $valid = $valid && $this->hasImageType($file, IMAGETYPE_JPEG);
-            } elseif ($extension === 'png') {
-                $valid = $valid && $this->hasImageType($file, IMAGETYPE_PNG);
-            }
-        }
-
-        if (! $valid) {
+        [$mime, $matchesContent] = $types[$extension];
+        if (! $matchesContent($contents, $file)) {
             throw ValidationException::withMessages([
                 'attachment' => ['The attachment content does not match an allowed file type.'],
             ]);
@@ -925,8 +913,194 @@ class ConversationController extends Controller
 
         return [
             'name' => ($stem ?: 'attachment').'.'.$extension,
-            'mime' => $allowed[$extension][0],
+            'mime' => $mime,
         ];
+    }
+
+    /**
+     * Allowed attachment types, matching the desktop app's file picker. Each
+     * entry is [MIME type served on download, content check]. Files are checked
+     * by their structure rather than libmagic, whose labels for Office, HEIC,
+     * and CSV files vary between servers.
+     *
+     * @return array<string, array{0: string, 1: \Closure(string, \Illuminate\Http\UploadedFile): bool}>
+     */
+    private function attachmentTypes(): array
+    {
+        $jpeg = ['image/jpeg', fn (string $c, $f) => str_starts_with($c, "\xFF\xD8\xFF")
+            && $this->hasImageType($f, IMAGETYPE_JPEG)];
+        $bmp = ['image/bmp', fn (string $c, $f) => str_starts_with($c, 'BM')
+            && $this->hasImageType($f, IMAGETYPE_BMP)];
+        $tiff = ['image/tiff', fn (string $c, $f) => (str_starts_with($c, "II*\0") || str_starts_with($c, "MM\0*"))
+            && ($this->hasImageType($f, IMAGETYPE_TIFF_II) || $this->hasImageType($f, IMAGETYPE_TIFF_MM))];
+        $heif = fn (string $mime) => [$mime, fn (string $c) => $this->hasIsoBrand(
+            $c, ['heic', 'heix', 'hevc', 'hevx', 'heim', 'heis', 'hevm', 'hevs', 'mif1', 'msf1']
+        )];
+        // Legacy Office files (doc, xls, ppt and their templates) are OLE2 compound documents.
+        $ole = fn (string $mime) => [$mime, fn (string $c) => str_starts_with($c, "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1")];
+        // Office Open XML files are ZIP packages with a content-types manifest and a part folder.
+        $ooxml = fn (string $mime, string $folder) => [$mime, fn (string $c, $f) => $this->isOfficeOpenXml($c, $f, $folder)];
+        // OpenDocument files are ZIP packages whose "mimetype" entry names the document type.
+        $odf = fn (string $mime) => [$mime, fn (string $c, $f) => $this->isOpenDocument($c, $f, $mime)];
+        $text = fn (string $mime) => [$mime, fn (string $c) => ! str_contains($c, "\0") && preg_match('//u', $c) === 1];
+
+        return [
+            'jpg' => $jpeg,
+            'jpeg' => $jpeg,
+            'jpe' => $jpeg,
+            'jfif' => $jpeg,
+            'png' => ['image/png', fn (string $c, $f) => str_starts_with($c, "\x89PNG\r\n\x1A\n")
+                && $this->hasImageType($f, IMAGETYPE_PNG)],
+            'gif' => ['image/gif', fn (string $c, $f) => (str_starts_with($c, 'GIF87a') || str_starts_with($c, 'GIF89a'))
+                && $this->hasImageType($f, IMAGETYPE_GIF)],
+            'webp' => ['image/webp', fn (string $c, $f) => substr($c, 0, 4) === 'RIFF' && substr($c, 8, 4) === 'WEBP'
+                && $this->hasImageType($f, IMAGETYPE_WEBP)],
+            'bmp' => $bmp,
+            'dib' => $bmp,
+            'tif' => $tiff,
+            'tiff' => $tiff,
+            'ico' => ['image/vnd.microsoft.icon', fn (string $c, $f) => str_starts_with($c, "\0\0\1\0")
+                && $this->hasImageType($f, IMAGETYPE_ICO)],
+            'avif' => ['image/avif', fn (string $c) => $this->hasIsoBrand($c, ['avif', 'avis'])],
+            'heic' => $heif('image/heic'),
+            'heif' => $heif('image/heif'),
+
+            'pdf' => ['application/pdf', fn (string $c) => str_starts_with($c, '%PDF-')],
+            'txt' => $text('text/plain'),
+            'csv' => $text('text/csv'),
+            'rtf' => ['application/rtf', fn (string $c) => str_starts_with($c, '{\rtf')],
+
+            'doc' => $ole('application/msword'),
+            'dot' => $ole('application/msword'),
+            'xls' => $ole('application/vnd.ms-excel'),
+            'xlt' => $ole('application/vnd.ms-excel'),
+            'ppt' => $ole('application/vnd.ms-powerpoint'),
+            'pot' => $ole('application/vnd.ms-powerpoint'),
+            'pps' => $ole('application/vnd.ms-powerpoint'),
+
+            'docx' => $ooxml('application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'word/'),
+            'docm' => $ooxml('application/vnd.ms-word.document.macroEnabled.12', 'word/'),
+            'dotx' => $ooxml('application/vnd.openxmlformats-officedocument.wordprocessingml.template', 'word/'),
+            'dotm' => $ooxml('application/vnd.ms-word.template.macroEnabled.12', 'word/'),
+            'xlsx' => $ooxml('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'xl/'),
+            'xlsm' => $ooxml('application/vnd.ms-excel.sheet.macroEnabled.12', 'xl/'),
+            'xlsb' => $ooxml('application/vnd.ms-excel.sheet.binary.macroEnabled.12', 'xl/'),
+            'xltx' => $ooxml('application/vnd.openxmlformats-officedocument.spreadsheetml.template', 'xl/'),
+            'xltm' => $ooxml('application/vnd.ms-excel.template.macroEnabled.12', 'xl/'),
+            'pptx' => $ooxml('application/vnd.openxmlformats-officedocument.presentationml.presentation', 'ppt/'),
+            'pptm' => $ooxml('application/vnd.ms-powerpoint.presentation.macroEnabled.12', 'ppt/'),
+            'ppsx' => $ooxml('application/vnd.openxmlformats-officedocument.presentationml.slideshow', 'ppt/'),
+
+            'odt' => $odf('application/vnd.oasis.opendocument.text'),
+            'odp' => $odf('application/vnd.oasis.opendocument.presentation'),
+            'ods' => $odf('application/vnd.oasis.opendocument.spreadsheet'),
+
+            'zip' => ['application/zip', fn (string $c, $f) => $this->isZip($c, $f)],
+        ];
+    }
+
+    /** Checks an ISO base media file (AVIF/HEIF) for one of the given major or compatible brands. */
+    private function hasIsoBrand(string $contents, array $brands): bool
+    {
+        if (strlen($contents) < 16 || substr($contents, 4, 4) !== 'ftyp') {
+            return false;
+        }
+        $boxSize = min(unpack('N', substr($contents, 0, 4))[1], 256, strlen($contents));
+        $candidates = [substr($contents, 8, 4)];
+        for ($offset = 16; $offset + 4 <= $boxSize; $offset += 4) {
+            $candidates[] = substr($contents, $offset, 4);
+        }
+
+        return array_intersect($candidates, $brands) !== [];
+    }
+
+    private function isZip(string $contents, \Illuminate\Http\UploadedFile $file): bool
+    {
+        if (! str_starts_with($contents, "PK\x03\x04") && ! str_starts_with($contents, "PK\x05\x06")) {
+            return false;
+        }
+
+        return $this->withZip($file, fn () => true) ?? true;
+    }
+
+    private function isOfficeOpenXml(string $contents, \Illuminate\Http\UploadedFile $file, string $folder): bool
+    {
+        if (! str_starts_with($contents, "PK\x03\x04")) {
+            return false;
+        }
+
+        // Without the zip extension, fall back to the ZIP signature check above.
+        return $this->withZip($file, function (\ZipArchive $zip) use ($folder) {
+            if ($zip->locateName('[Content_Types].xml') === false) {
+                return false;
+            }
+            for ($index = 0; $index < $zip->numFiles; $index++) {
+                if (str_starts_with((string) $zip->getNameIndex($index), $folder)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }) ?? true;
+    }
+
+    private function isOpenDocument(string $contents, \Illuminate\Http\UploadedFile $file, string $mime): bool
+    {
+        if (! str_starts_with($contents, "PK\x03\x04")) {
+            return false;
+        }
+
+        return $this->withZip($file, fn (\ZipArchive $zip) => $zip->getFromName('mimetype') === $mime)
+            ?? str_contains(substr($contents, 0, 200), $mime);
+    }
+
+    /**
+     * Runs a check against the uploaded file opened as a ZIP archive. Returns
+     * false for an unreadable archive, or null when the zip extension is missing.
+     */
+    private function withZip(\Illuminate\Http\UploadedFile $file, \Closure $check): ?bool
+    {
+        if (! class_exists(\ZipArchive::class)) {
+            return null;
+        }
+        $zip = new \ZipArchive();
+        if ($zip->open($file->getRealPath(), \ZipArchive::RDONLY) !== true) {
+            return false;
+        }
+        try {
+            return (bool) $check($zip);
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /**
+     * Protected messages are encrypted on the sender's device with a key derived
+     * from a one-time password the server never sees. The server only checks that
+     * the body is a well-formed envelope, and stores it (itself encrypted at rest).
+     */
+    private function validatedProtectedEnvelope(?string $body): void
+    {
+        $envelope = is_string($body) ? json_decode($body, true) : null;
+        $decodedLength = fn ($value) => is_string($value) && preg_match('/^[A-Za-z0-9+\/]+={0,2}$/', $value)
+            ? strlen((string) base64_decode($value, true))
+            : -1;
+
+        $valid = is_array($envelope)
+            && array_keys($envelope) === ['v', 'alg', 'kdf', 'iter', 'salt', 'iv', 'ct']
+            && $envelope['v'] === 1
+            && $envelope['alg'] === 'AES-256-GCM'
+            && $envelope['kdf'] === 'PBKDF2-SHA256'
+            && is_int($envelope['iter']) && $envelope['iter'] >= 100000 && $envelope['iter'] <= 5000000
+            && $decodedLength($envelope['salt']) === 16
+            && $decodedLength($envelope['iv']) === 12
+            && $decodedLength($envelope['ct']) > 16;
+
+        if (! $valid) {
+            throw ValidationException::withMessages([
+                'body' => ['The protected message is not a valid encrypted envelope.'],
+            ]);
+        }
     }
 
     /**
