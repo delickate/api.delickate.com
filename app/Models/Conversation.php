@@ -15,6 +15,8 @@ class Conversation extends Model
         'type',
         'name',
         'created_by_user_id',
+        'request_status',
+        'requested_by_user_id',
     ];
 
     public function messages(): HasMany

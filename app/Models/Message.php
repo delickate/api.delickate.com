@@ -29,6 +29,8 @@ class Message extends Model
         'deleted_for_everyone_at',
         'edited_at',
         'key_version',
+        'pinned_at',
+        'pinned_by_user_id',
     ];
 
     protected $casts = [
@@ -40,6 +42,7 @@ class Message extends Model
         'deleted_for_everyone_at' => 'datetime',
         'edited_at' => 'datetime',
         'key_version' => 'integer',
+        'pinned_at' => 'datetime',
     ];
 
     public function setBodyAttribute($value): void

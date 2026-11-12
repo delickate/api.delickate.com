@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\FriendRequest;
 use App\Models\User;
+use App\Support\Realtime;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -67,6 +68,8 @@ class FriendController extends Controller
                 ->delete();
         });
 
+        Realtime::push([$blockerId, $user->id], 'friends.changed', []);
+
         return response()->json([
             'message' => 'User blocked.',
             'user_id' => $user->id,
@@ -79,6 +82,8 @@ class FriendController extends Controller
         if ($deleted === 0) {
             return response()->json(['message' => 'This user is not in your blocked list.'], 404);
         }
+
+        Realtime::push([$request->user()->id, $user->id], 'friends.changed', []);
 
         return response()->json([
             'message' => 'User unblocked.',
@@ -187,6 +192,8 @@ class FriendController extends Controller
             ]);
         });
 
+        Realtime::push([$userId, $friendId], 'friends.changed', []);
+
         return response()->json([
             'id' => $friendRequest->id,
             'status' => $friendRequest->status,
@@ -215,6 +222,7 @@ class FriendController extends Controller
         }
 
         $friendRequest->update(['status' => $action === 'accept' ? 'accepted' : 'rejected']);
+        Realtime::push([$friendRequest->low_user_id, $friendRequest->high_user_id], 'friends.changed', []);
 
         return response()->json([
             'id' => $friendRequest->id,
@@ -244,6 +252,7 @@ class FriendController extends Controller
         }
 
         $friendRequest->delete();
+        Realtime::push([$requestingUserId, $user->id], 'friends.changed', []);
 
         return response()->json([
             'message' => 'Friend removed.',

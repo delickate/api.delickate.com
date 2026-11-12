@@ -386,7 +386,7 @@ class ChatApiTest extends TestCase
             ->assertJsonPath('errors.phone.0', 'This user is already your friend.');
     }
 
-    public function test_blocking_hides_friendship_and_disables_direct_chat_until_unblocked(): void
+    public function test_blocking_hides_friendship_and_makes_direct_chat_read_only_until_unblocked(): void
     {
         [$blocker, $blocked, $conversation] = $this->makeConversation();
         FriendRequest::create([
@@ -406,24 +406,30 @@ class ChatApiTest extends TestCase
         $this->getJson('/api/friends')
             ->assertOk()
             ->assertJsonCount(0, 'data');
+        // Both people can still read the old chat, which is marked as blocked.
         $this->getJson('/api/conversations')
             ->assertOk()
-            ->assertJsonCount(0, 'data');
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.blocked', 'by_me');
         Sanctum::actingAs($blocked);
         $this->getJson('/api/friends')
             ->assertOk()
             ->assertJsonCount(0, 'data');
         $this->getJson('/api/conversations')
             ->assertOk()
-            ->assertJsonCount(0, 'data');
+            ->assertJsonPath('data.0.blocked', 'by_them');
         $this->getJson("/api/conversations/{$conversation->id}/messages")
-            ->assertNotFound();
+            ->assertOk();
         Sanctum::actingAs($blocker);
         $this->postJson('/api/friends/requests', ['phone' => $blocked->phone])
             ->assertUnprocessable()
             ->assertJsonValidationErrors('phone');
 
+        // ...but nobody can send, edit or pin while blocked.
         Sanctum::actingAs($blocked);
+        $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => 'Blocked message'])
+            ->assertNotFound();
+        Sanctum::actingAs($blocker);
         $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => 'Blocked message'])
             ->assertNotFound();
 
@@ -1211,6 +1217,142 @@ class ChatApiTest extends TestCase
         $this->assertSame([$ids[0]], array_column($oldest->json('data'), 'id'));
 
         $this->getJson("/api/conversations/{$conversation->id}/messages?limit=500")->assertUnprocessable();
+    }
+
+    public function test_non_friends_can_start_a_chat_as_a_message_request(): void
+    {
+        $sender = User::factory()->create(['phone' => '+15550000091']);
+        $recipient = User::factory()->create(['phone' => '+15550000092']);
+
+        Sanctum::actingAs($sender);
+        $conversation = $this->postJson('/api/conversations', ['phone' => $recipient->phone])
+            ->assertCreated()
+            ->assertJsonPath('request.status', 'pending')
+            ->assertJsonPath('request.incoming', false)
+            ->json();
+        $this->postJson("/api/conversations/{$conversation['id']}/messages", ['body' => 'Hello, can we talk?'])->assertCreated();
+        $this->postJson('/api/conversations', ['phone' => '+19999999999'])
+            ->assertUnprocessable()->assertJsonValidationErrors('phone');
+
+        Sanctum::actingAs($recipient);
+        $this->getJson('/api/conversations')
+            ->assertOk()
+            ->assertJsonPath('data.0.request.incoming', true)
+            ->assertJsonPath('data.0.unread_count', 1);
+        $this->postJson("/api/conversations/{$conversation['id']}/request/accept")->assertOk();
+        $this->getJson('/api/conversations')->assertOk()->assertJsonPath('data.0.request', null);
+    }
+
+    public function test_declined_message_requests_stop_the_sender_and_hide_the_chat(): void
+    {
+        $sender = User::factory()->create();
+        $recipient = User::factory()->create();
+
+        Sanctum::actingAs($sender);
+        $conversationId = $this->postJson('/api/conversations', ['friend_id' => $recipient->id])->json('id');
+        $this->postJson("/api/conversations/{$conversationId}/request/decline")->assertForbidden();
+
+        Sanctum::actingAs($recipient);
+        $this->postJson("/api/conversations/{$conversationId}/request/decline")->assertOk();
+        $this->getJson('/api/conversations')->assertOk()->assertJsonCount(0, 'data');
+
+        Sanctum::actingAs($sender);
+        $this->postJson("/api/conversations/{$conversationId}/messages", ['body' => 'Hello?'])
+            ->assertForbidden()
+            ->assertJsonPath('message', 'This person declined your message request.');
+    }
+
+    public function test_replying_to_a_message_request_accepts_it(): void
+    {
+        $sender = User::factory()->create();
+        $recipient = User::factory()->create();
+        Sanctum::actingAs($sender);
+        $conversationId = $this->postJson('/api/conversations', ['friend_id' => $recipient->id])->json('id');
+
+        Sanctum::actingAs($recipient);
+        $this->postJson("/api/conversations/{$conversationId}/messages", ['body' => 'Hi!'])->assertCreated();
+        $this->assertNull(Conversation::findOrFail($conversationId)->request_status);
+    }
+
+    public function test_members_can_pin_up_to_three_messages_shared_with_the_chat(): void
+    {
+        [$first, $second, $conversation] = $this->makeConversation();
+        Sanctum::actingAs($first);
+        $ids = collect(range(1, 4))->map(fn ($index) => $this->postJson(
+            "/api/conversations/{$conversation->id}/messages", ['body' => "note {$index}"]
+        )->json('id'));
+
+        foreach ($ids as $index => $id) {
+            $this->travel(1)->seconds();
+            Sanctum::actingAs($index % 2 ? $second : $first);
+            $this->postJson("/api/conversations/{$conversation->id}/messages/{$id}/pin")->assertOk();
+        }
+
+        // The oldest pin made way for the fourth; everyone sees the same three.
+        Sanctum::actingAs($second);
+        $pinned = $this->getJson("/api/conversations/{$conversation->id}/messages")->assertOk()->json('pinned');
+        $this->assertSame([$ids[3], $ids[2], $ids[1]], array_column($pinned, 'id'));
+
+        $this->deleteJson("/api/conversations/{$conversation->id}/messages/{$ids[2]}/pin")->assertOk();
+        $this->assertSame(
+            [$ids[3], $ids[1]],
+            array_column($this->getJson("/api/conversations/{$conversation->id}/messages")->json('pinned'), 'id'),
+        );
+
+        Sanctum::actingAs(User::factory()->create());
+        $this->postJson("/api/conversations/{$conversation->id}/messages/{$ids[0]}/pin")->assertNotFound();
+    }
+
+    public function test_call_history_can_show_only_missed_calls(): void
+    {
+        [$caller, $callee, $conversation] = $this->makeConversation();
+        Sanctum::actingAs($caller);
+        foreach ([['55555555-5555-4555-8555-555555555555', 'missed'], ['66666666-6666-4666-8666-666666666666', 'completed']] as [$callId, $status]) {
+            $this->postJson("/api/conversations/{$conversation->id}/calls", [
+                'call_id' => $callId, 'caller_id' => $caller->id, 'status' => $status,
+                'media_type' => 'audio', 'duration_seconds' => $status === 'missed' ? 0 : 30,
+            ])->assertCreated();
+        }
+
+        Sanctum::actingAs($callee);
+        $this->getJson('/api/call-history?filter=missed')
+            ->assertOk()->assertJsonCount(1, 'data')->assertJsonPath('data.0.status', 'missed');
+        $this->getJson('/api/call-history')->assertOk()->assertJsonCount(2, 'data');
+
+        // The caller did not miss their own unanswered call.
+        Sanctum::actingAs($caller);
+        $this->getJson('/api/call-history?filter=missed')->assertOk()->assertJsonCount(0, 'data');
+    }
+
+    public function test_changes_are_pushed_to_the_socket_server_for_every_member(): void
+    {
+        config([
+            'services.socket.internal_url' => 'http://socket.internal',
+            'services.socket.internal_secret' => 'push-secret',
+        ]);
+        \Illuminate\Support\Facades\Http::fake(['socket.internal/*' => \Illuminate\Support\Facades\Http::response(['delivered' => 2], 202)]);
+        [$sender, $recipient, $conversation] = $this->makeConversation();
+
+        Sanctum::actingAs($sender);
+        $messageId = $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => 'Instant'])->json('id');
+        Sanctum::actingAs($recipient);
+        $this->postJson("/api/conversations/{$conversation->id}/read")->assertOk();
+
+        $events = collect();
+        \Illuminate\Support\Facades\Http::assertSent(function ($request) use ($events) {
+            $this->assertSame('http://socket.internal/internal/events', $request->url());
+            $this->assertSame(['Bearer push-secret'], $request->header('Authorization'));
+            $events->push(...$request['events']);
+
+            return true;
+        });
+        $created = $events->where('event', 'message.created')->values();
+        $this->assertEqualsCanonicalizing([$sender->id, $recipient->id], $created->pluck('user_ids.0')->all());
+        $this->assertSame($messageId, $created[0]['payload']['message']['id']);
+        $this->assertSame('Instant', $created[0]['payload']['message']['body']);
+        $read = $events->firstWhere('event', 'conversation.read');
+        $this->assertSame($recipient->id, $read['payload']['user_id']);
+        $this->assertSame($messageId, $read['payload']['last_read_message_id']);
     }
 
     public function test_voice_messages_are_validated(): void

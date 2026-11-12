@@ -8,6 +8,7 @@ use App\Models\FriendRequest;
 use App\Models\Message;
 use App\Models\User;
 use App\Support\ConversationKeys;
+use App\Support\Realtime;
 use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -20,6 +21,14 @@ class ConversationController extends Controller
 {
     private const MAX_VOICE_SECONDS = 600;
 
+    private const MAX_PINNED_MESSAGES = 3;
+
+    /**
+     * Block states for the current request: other user id => 'by_me' | 'by_them'.
+     * Keyed by request, because Laravel may reuse a controller across requests.
+     */
+    private array $blockStates = ['request' => null, 'states' => []];
+
     public function index(Request $request): JsonResponse
     {
         $userId = (int) $request->user()->id;
@@ -30,14 +39,12 @@ class ConversationController extends Controller
                         ->orWhere('high_user_id', $userId);
                 })->orWhereHas('participants', fn ($participantQuery) => $participantQuery->where('users.id', $userId));
             })
-            ->whereNotExists(fn ($query) => $query->selectRaw('1')
-                ->from('user_blocks')
-                ->whereColumn('user_blocks.blocker_id', 'conversations.low_user_id')
-                ->whereColumn('user_blocks.blocked_id', 'conversations.high_user_id'))
-            ->whereNotExists(fn ($query) => $query->selectRaw('1')
-                ->from('user_blocks')
-                ->whereColumn('user_blocks.blocker_id', 'conversations.high_user_id')
-                ->whereColumn('user_blocks.blocked_id', 'conversations.low_user_id'))
+            // Blocked chats stay listed (read-only); a declined message request is
+            // hidden from the person who declined it.
+            ->where(fn ($query) => $query
+                ->whereNull('request_status')
+                ->orWhere('request_status', '!=', 'declined')
+                ->orWhere('requested_by_user_id', $userId))
             ->with([
                 'lowUser:id,name,phone,profile_picture_path',
                 'highUser:id,name,phone,profile_picture_path',
@@ -52,21 +59,7 @@ class ConversationController extends Controller
                     ->latest('id')
                     ->limit(1),
             ])
-            ->withCount([
-                // Unread means newer than this person's own read position. (A
-                // message's read_at is set by whoever reads it first, so in a
-                // group it cannot tell whether *this* member has read it.)
-                'messages as unread_count' => fn ($query) => $query
-                    ->where('sender_id', '!=', $userId)
-                    ->whereRaw(
-                        'messages.id > COALESCE((SELECT conversation_reads.last_read_message_id FROM conversation_reads'
-                        .' WHERE conversation_reads.conversation_id = messages.conversation_id'
-                        .' AND conversation_reads.user_id = ?), 0)',
-                        [$userId]
-                    )
-                    ->whereNull('deleted_for_everyone_at')
-                    ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId)),
-            ])
+            ->withCount(['messages as unread_count' => $this->unreadMessages($userId)])
             ->orderByDesc('updated_at')
             ->paginate(50);
 
@@ -80,10 +73,14 @@ class ConversationController extends Controller
     public function store(Request $request): JsonResponse
     {
         $validated = $request->validate([
-            'friend_id' => ['required', 'integer', 'exists:users,id'],
+            'friend_id' => ['required_without:phone', 'integer', 'exists:users,id'],
+            'phone' => ['required_without:friend_id', 'string', 'max:20'],
         ]);
         $userId = (int) $request->user()->id;
-        $friendId = (int) $validated['friend_id'];
+        $friendId = isset($validated['friend_id'])
+            ? (int) $validated['friend_id']
+            : (int) (User::where('phone', $validated['phone'])->value('id')
+                ?? throw ValidationException::withMessages(['phone' => ['No PITBConnect account uses this phone number.']]));
 
         if ($userId === $friendId) {
             throw ValidationException::withMessages(['friend_id' => ['You cannot start a conversation with yourself.']]);
@@ -99,16 +96,19 @@ class ConversationController extends Controller
             ->where('status', 'accepted')
             ->exists();
 
-        if (! $isFriend) {
-            return response()->json(['message' => 'You can only message accepted friends.'], 403);
-        }
-
+        // Friends chat straight away. Anyone else gets a message request the
+        // recipient can accept (or simply reply to) or decline.
         $conversation = Conversation::firstOrCreate([
             'low_user_id' => $lowId,
             'high_user_id' => $highId,
         ], [
             'type' => 'direct',
+            'request_status' => $isFriend ? null : 'pending',
+            'requested_by_user_id' => $isFriend ? null : $userId,
         ]);
+        if ($conversation->wasRecentlyCreated) {
+            Realtime::push([$lowId, $highId], 'conversation.changed', ['conversation_id' => $conversation->id]);
+        }
 
         $conversation->load([
             'lowUser:id,name,phone,profile_picture_path',
@@ -123,15 +123,32 @@ class ConversationController extends Controller
                 ])
                 ->latest('id')
                 ->limit(1),
-        ])->loadCount([
-            'messages as unread_count' => fn ($query) => $query
-                ->where('sender_id', '!=', $userId)
-                ->whereNull('read_at')
-                ->whereNull('deleted_for_everyone_at')
-                ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId)),
-        ]);
+        ])->loadCount(['messages as unread_count' => $this->unreadMessages($userId)]);
 
         return response()->json($this->conversationData($conversation, $userId), 201);
+    }
+
+    public function respondToRequest(Request $request, Conversation $conversation, string $action): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        if (! $this->userIsParticipant($conversation, $userId) || $conversation->request_status === null) {
+            return response()->json(['message' => 'Message request not found.'], 404);
+        }
+        if ((int) $conversation->requested_by_user_id === $userId) {
+            return response()->json(['message' => 'Only the recipient can respond to a message request.'], 403);
+        }
+
+        $conversation->forceFill(['request_status' => $action === 'accept' ? null : 'declined'])->save();
+        Realtime::push(
+            [$conversation->low_user_id, $conversation->high_user_id],
+            'conversation.changed',
+            ['conversation_id' => $conversation->id],
+        );
+
+        return response()->json([
+            'conversation_id' => $conversation->id,
+            'status' => $action === 'accept' ? 'accepted' : 'declined',
+        ]);
     }
 
     public function createGroup(Request $request): JsonResponse
@@ -206,6 +223,8 @@ class ConversationController extends Controller
                 ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId)),
         ]);
 
+        Realtime::push($this->participantIds($conversation), 'conversation.changed', ['conversation_id' => $conversation->id]);
+
         return response()->json($this->conversationData($conversation, $userId), 201);
     }
 
@@ -259,6 +278,8 @@ class ConversationController extends Controller
         }
         $member = User::query()->select(['id', 'name', 'phone', 'profile_picture_path'])->findOrFail($memberId);
 
+        Realtime::push($this->participantIds($conversation), 'conversation.changed', ['conversation_id' => $conversation->id]);
+
         return response()->json([
             'message' => 'Member added to group.',
             'conversation_id' => $conversation->id,
@@ -281,6 +302,12 @@ class ConversationController extends Controller
         $conversation->participants()->detach($userId);
         // Whoever left must not be able to read anything sent from now on.
         ConversationKeys::rotate($conversation);
+
+        Realtime::push(
+            [...$this->participantIds($conversation), $userId],
+            'conversation.changed',
+            ['conversation_id' => $conversation->id],
+        );
 
         return response()->json([
             'message' => 'You left the group.',
@@ -317,6 +344,12 @@ class ConversationController extends Controller
         // Whoever left must not be able to read anything sent from now on.
         ConversationKeys::rotate($conversation);
 
+        Realtime::push(
+            [...$this->participantIds($conversation), $user->id],
+            'conversation.changed',
+            ['conversation_id' => $conversation->id],
+        );
+
         return response()->json([
             'message' => 'Member removed from group.',
             'conversation_id' => $conversation->id,
@@ -351,12 +384,9 @@ class ConversationController extends Controller
     public function keys(Request $request, Conversation $conversation): JsonResponse
     {
         $userId = (int) $request->user()->id;
+        // Blocked chats remain readable, so their keys are still available.
         if (! $this->userIsParticipant($conversation, $userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
-        }
-        if ($conversation->type !== 'group' &&
-            $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
-            return response()->json(['message' => 'This direct conversation is unavailable.'], 404);
         }
 
         return response()->json([
@@ -401,12 +431,9 @@ class ConversationController extends Controller
     {
         $userId = (int) $request->user()->id;
 
+        // Blocked chats remain readable (sending is refused elsewhere).
         if (! $this->userIsParticipant($conversation, $userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
-        }
-        if ($conversation->type !== 'group' &&
-            $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
-            return response()->json(['message' => 'This direct conversation is unavailable.'], 404);
         }
 
         $validated = $request->validate([
@@ -449,8 +476,18 @@ class ConversationController extends Controller
             ->get(['user_id', 'last_read_message_id', 'read_at']);
         $readers = User::query()->whereKey($readCursors->pluck('user_id'))->get()->keyBy('id');
 
+        $pinned = $conversation->messages()
+            ->whereNotNull('pinned_at')
+            ->whereDoesntHave('hiddenFromUsers', fn ($query) => $query->where('users.id', $userId))
+            ->with('sender:id,name,phone,profile_picture_path')
+            ->orderByDesc('pinned_at')
+            ->get()
+            ->map(fn (Message $message) => $this->messageData($message, $userId))
+            ->values();
+
         return response()->json([
             ...$page,
+            'pinned' => $pinned,
             'read_cursors' => $readCursors->map(fn ($cursor) => [
                 'user' => $this->publicUser($readers->get($cursor->user_id)),
                 'last_read_message_id' => (int) $cursor->last_read_message_id,
@@ -462,8 +499,13 @@ class ConversationController extends Controller
     public function callHistory(Request $request): JsonResponse
     {
         $userId = (int) $request->user()->id;
+        $validated = $request->validate(['filter' => ['sometimes', 'in:all,missed']]);
         $callHistory = Message::query()
             ->where('type', 'call')
+            // "Missed" means calls this user missed: missed calls from someone else.
+            ->when(($validated['filter'] ?? 'all') === 'missed', fn ($query) => $query
+                ->where('call_status', 'missed')
+                ->where('sender_id', '!=', $userId))
             ->whereHas('conversation', fn ($query) => $query
                 ->where(fn ($directQuery) => $directQuery
                     ->where('type', 'direct')
@@ -570,6 +612,7 @@ class ConversationController extends Controller
         }
 
         $message->load('sender:id,name,phone,profile_picture_path');
+        $this->pushMessage($conversation, $message, 'message.created');
 
         return response()->json($this->messageData($message, $userId), 201);
     }
@@ -584,6 +627,10 @@ class ConversationController extends Controller
         if ($conversation->type !== 'group' &&
             $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
             return response()->json(['message' => 'This direct conversation is unavailable.'], 404);
+        }
+
+        if ($conversation->request_status === 'declined') {
+            return response()->json(['message' => 'This person declined your message request.'], 403);
         }
 
         $validated = $request->validate([
@@ -671,7 +718,13 @@ class ConversationController extends Controller
                     $message->save();
                 }
 
+                // Replying to a message request accepts it.
+                if ($conversation->request_status === 'pending' &&
+                    (int) $conversation->requested_by_user_id !== $userId) {
+                    $conversation->request_status = null;
+                }
                 $conversation->touch();
+                $conversation->save();
 
                 return $message;
             });
@@ -688,6 +741,8 @@ class ConversationController extends Controller
             'replyTo.sender:id,name,profile_picture_path',
             'replyTo.hiddenFromUsers' => fn ($query) => $query->where('users.id', $userId),
         ]);
+
+        $this->pushMessage($conversation, $message, 'message.created');
 
         return response()->json($this->messageData($message, $userId), 201);
     }
@@ -773,6 +828,7 @@ class ConversationController extends Controller
         }
 
         $forwardedMessage->load('sender:id,name,phone,profile_picture_path');
+        $this->pushMessage($targetConversation, $forwardedMessage, 'message.created');
 
         return response()->json($this->messageData($forwardedMessage, $userId), 201);
     }
@@ -845,7 +901,46 @@ class ConversationController extends Controller
             'replyTo.hiddenFromUsers' => fn ($query) => $query->where('users.id', $userId),
         ]);
 
+        $this->pushMessage($conversation, $message, 'message.updated');
+
         return response()->json($this->messageData($message, $userId));
+    }
+
+    public function pinMessage(Request $request, Conversation $conversation, Message $message): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        if ($response = $this->pinnableOrFail($conversation, $message, $userId)) {
+            return $response;
+        }
+
+        DB::transaction(function () use ($conversation, $message, $userId) {
+            $message->forceFill(['pinned_at' => now(), 'pinned_by_user_id' => $userId])->save();
+            // Keep at most three pins: the oldest one is unpinned, as in WhatsApp.
+            $conversation->messages()
+                ->whereNotNull('pinned_at')
+                ->orderByDesc('pinned_at')
+                ->orderByDesc('id')
+                ->skip(self::MAX_PINNED_MESSAGES)
+                ->take(PHP_INT_MAX)
+                ->get()
+                ->each(fn (Message $old) => $old->forceFill(['pinned_at' => null, 'pinned_by_user_id' => null])->save());
+        });
+        Realtime::push($this->participantIds($conversation), 'conversation.pins', ['conversation_id' => $conversation->id]);
+
+        return response()->json(['message' => 'Message pinned.', 'message_id' => $message->id]);
+    }
+
+    public function unpinMessage(Request $request, Conversation $conversation, Message $message): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        if ($response = $this->pinnableOrFail($conversation, $message, $userId)) {
+            return $response;
+        }
+
+        $message->forceFill(['pinned_at' => null, 'pinned_by_user_id' => null])->save();
+        Realtime::push($this->participantIds($conversation), 'conversation.pins', ['conversation_id' => $conversation->id]);
+
+        return response()->json(['message' => 'Message unpinned.', 'message_id' => $message->id]);
     }
 
     public function deleteMessage(Request $request, Conversation $conversation, Message $message): JsonResponse
@@ -884,8 +979,12 @@ class ConversationController extends Controller
                 'attachment_size' => null,
                 'voice_duration_seconds' => null,
                 'deleted_for_everyone_at' => now(),
+                'pinned_at' => null,
+                'pinned_by_user_id' => null,
             ])->save();
         });
+        $message->load('sender:id,name,phone,profile_picture_path');
+        $this->pushMessage($conversation, $message, 'message.updated');
 
         if ($attachmentPath && ! Storage::disk('private')->delete($attachmentPath)) {
             return response()->json([
@@ -902,9 +1001,7 @@ class ConversationController extends Controller
 
         if (! $this->userIsParticipant($conversation, $userId)
             || (int) $message->conversation_id !== (int) $conversation->id
-            || ! $message->attachment_path
-            || ($conversation->type !== 'group' &&
-                $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id))) {
+            || ! $message->attachment_path) {
             return response()->json(['message' => 'Attachment not found.'], 404);
         }
 
@@ -933,10 +1030,6 @@ class ConversationController extends Controller
         $userId = (int) $request->user()->id;
 
         if (! $this->userIsParticipant($conversation, $userId)) {
-            return response()->json(['message' => 'Conversation not found.'], 404);
-        }
-        if ($conversation->type !== 'group' &&
-            $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
         }
 
@@ -993,6 +1086,21 @@ class ConversationController extends Controller
                 ]);
         }
 
+        if ($column === 'read_at') {
+            $cursor = DB::table('conversation_reads')
+                ->where('conversation_id', $conversation->id)
+                ->where('user_id', $userId)
+                ->first();
+            if ($cursor) {
+                Realtime::push($this->participantIds($conversation), 'conversation.read', [
+                    'conversation_id' => $conversation->id,
+                    'user_id' => $userId,
+                    'last_read_message_id' => (int) $cursor->last_read_message_id,
+                    'read_at' => \Illuminate\Support\Carbon::parse($cursor->read_at)->toISOString(),
+                ]);
+            }
+        }
+
         return response()->json([
             'updated_count' => $updated,
             $column => $now->toISOString(),
@@ -1015,6 +1123,13 @@ class ConversationController extends Controller
             'unread_count' => $conversation->unread_count ?? 0,
             'created_at' => $conversation->created_at,
             'updated_at' => $conversation->updated_at,
+            // A chat started by someone who is not a friend, until accepted.
+            'request' => $conversation->request_status ? [
+                'status' => $conversation->request_status,
+                'incoming' => (int) $conversation->requested_by_user_id !== $userId,
+            ] : null,
+            // Blocked chats are read-only: 'by_me' or 'by_them'.
+            'blocked' => $otherUser ? $this->blockStateWith($userId, (int) $otherUser->id) : null,
         ];
 
         if ($conversationType === 'group') {
@@ -1036,7 +1151,7 @@ class ConversationController extends Controller
         $replyIsHidden = $reply
             && $userId !== null
             && $reply->relationLoaded('hiddenFromUsers')
-            && $reply->hiddenFromUsers->isNotEmpty();
+            && $reply->hiddenFromUsers->contains('id', $userId);
 
         return [
             'id' => $message->id,
@@ -1071,6 +1186,7 @@ class ConversationController extends Controller
                 : null,
             'deleted_for_everyone_at' => $message->deleted_for_everyone_at,
             'edited_at' => $message->edited_at,
+            'pinned_at' => $message->pinned_at,
             // Encrypted messages: body is ciphertext, and the real attachment name
             // and type are inside it; clients decrypt with the conversation key.
             'encrypted' => $message->key_version !== null,
@@ -1103,6 +1219,83 @@ class ConversationController extends Controller
         }
 
         return $conversation->participants()->whereKey($userId)->exists();
+    }
+
+    /** Unread = from others and newer than this person's own read position. */
+    private function unreadMessages(int $userId): \Closure
+    {
+        return fn ($query) => $query
+            ->where('sender_id', '!=', $userId)
+            ->whereRaw(
+                'messages.id > COALESCE((SELECT conversation_reads.last_read_message_id FROM conversation_reads'
+                .' WHERE conversation_reads.conversation_id = messages.conversation_id'
+                .' AND conversation_reads.user_id = ?), 0)',
+                [$userId]
+            )
+            ->whereNull('deleted_for_everyone_at')
+            ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId));
+    }
+
+    /** @return array<int, int> */
+    private function participantIds(Conversation $conversation): array
+    {
+        return $conversation->type === 'group'
+            ? $conversation->participants()->pluck('users.id')->map(fn ($id) => (int) $id)->all()
+            : [(int) $conversation->low_user_id, (int) $conversation->high_user_id];
+    }
+
+    /** Sends a message to every member's apps, shaped for each member. */
+    private function pushMessage(Conversation $conversation, Message $message, string $event): void
+    {
+        if (! Realtime::enabled()) {
+            return;
+        }
+        $message->loadMissing(['sender:id,name,phone,profile_picture_path', 'replyTo.sender:id,name,profile_picture_path', 'replyTo.hiddenFromUsers']);
+        foreach ($this->participantIds($conversation) as $memberId) {
+            Realtime::push([$memberId], $event, [
+                'conversation_id' => $conversation->id,
+                'message' => $this->messageData($message, $memberId),
+            ]);
+        }
+    }
+
+    private function pinnableOrFail(Conversation $conversation, Message $message, int $userId): ?JsonResponse
+    {
+        if (! $this->userIsParticipant($conversation, $userId)
+            || (int) $message->conversation_id !== (int) $conversation->id
+            || $message->hiddenFromUsers()->where('users.id', $userId)->exists()) {
+            return response()->json(['message' => 'Message not found.'], 404);
+        }
+        if ($conversation->type !== 'group' &&
+            $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
+            return response()->json(['message' => 'This chat is read-only while blocked.'], 403);
+        }
+        if ($message->deleted_for_everyone_at || $message->type === 'call') {
+            return response()->json(['message' => 'This message cannot be pinned.'], 422);
+        }
+
+        return null;
+    }
+
+    private function blockStateWith(int $userId, int $otherUserId): ?string
+    {
+        $requestId = spl_object_id(request()).':'.$userId;
+        if ($this->blockStates['request'] !== $requestId) {
+            $this->blockStates = ['request' => $requestId, 'states' => []];
+            DB::table('user_blocks')
+                ->where('blocker_id', $userId)
+                ->orWhere('blocked_id', $userId)
+                ->get(['blocker_id', 'blocked_id'])
+                ->each(function ($block) use ($userId) {
+                    if ((int) $block->blocker_id === $userId) {
+                        $this->blockStates['states'][(int) $block->blocked_id] = 'by_me';
+                    } else {
+                        $this->blockStates['states'][(int) $block->blocker_id] ??= 'by_them';
+                    }
+                });
+        }
+
+        return $this->blockStates['states'][$otherUserId] ?? null;
     }
 
     private function usersHaveBlock(int $firstUserId, int $secondUserId): bool

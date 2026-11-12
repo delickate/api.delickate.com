@@ -2,6 +2,13 @@
 
 return [
 
+    // The socket server's internal events endpoint, which the API uses to push
+    // realtime updates. Leave unset to disable pushing (apps then rely on refresh).
+    'socket' => [
+        'internal_url' => env('SOCKET_INTERNAL_URL'),
+        'internal_secret' => env('SOCKET_INTERNAL_SECRET'),
+    ],
+
     /*
     |--------------------------------------------------------------------------
     | Third Party Services
