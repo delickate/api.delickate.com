@@ -23,6 +23,7 @@ class Message extends Model
         'call_status',
         'call_media_type',
         'call_duration_seconds',
+        'voice_duration_seconds',
         'delivered_at',
         'read_at',
         'deleted_for_everyone_at',
@@ -33,6 +34,7 @@ class Message extends Model
         'read_at' => 'datetime',
         'is_forwarded' => 'boolean',
         'call_duration_seconds' => 'integer',
+        'voice_duration_seconds' => 'integer',
         'deleted_for_everyone_at' => 'datetime',
     ];
 

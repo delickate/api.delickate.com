@@ -730,6 +730,129 @@ class ChatApiTest extends TestCase
             ->assertNotFound();
     }
 
+    public function test_voice_message_can_be_sent_downloaded_and_forwarded(): void
+    {
+        Storage::fake('private');
+        [$sender, $recipient, $conversation] = $this->makeConversation();
+        $thirdUser = User::factory()->create();
+        $otherConversation = Conversation::create([
+            'low_user_id' => min($sender->id, $thirdUser->id),
+            'high_user_id' => max($sender->id, $thirdUser->id),
+        ]);
+        Sanctum::actingAs($sender);
+
+        $response = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'voice' => UploadedFile::fake()->createWithContent('anything.bin', $this->webmVoiceBytes()),
+            'voice_duration_seconds' => 7,
+        ]);
+
+        $response->assertCreated()
+            ->assertJsonPath('type', 'voice')
+            ->assertJsonPath('body', null)
+            ->assertJsonPath('voice.duration_seconds', 7)
+            ->assertJsonPath('attachment.name', 'voice-message.webm')
+            ->assertJsonPath('attachment.mime', 'audio/webm');
+
+        $message = Message::findOrFail($response->json('id'));
+        Storage::disk('private')->assertExists($message->attachment_path);
+
+        Sanctum::actingAs($recipient);
+        $this->get("/api/conversations/{$conversation->id}/messages/{$message->id}/attachment")
+            ->assertOk()
+            ->assertHeader('Content-Type', 'audio/webm');
+
+        Sanctum::actingAs($sender);
+        $this->postJson("/api/conversations/{$conversation->id}/messages/{$message->id}/forward", [
+            'target_conversation_id' => $otherConversation->id,
+        ])->assertCreated()
+            ->assertJsonPath('type', 'voice')
+            ->assertJsonPath('voice.duration_seconds', 7)
+            ->assertJsonPath('is_forwarded', true);
+    }
+
+    public function test_voice_messages_are_validated(): void
+    {
+        Storage::fake('private');
+        [$sender, , $conversation] = $this->makeConversation();
+        Sanctum::actingAs($sender);
+
+        $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'voice' => UploadedFile::fake()->createWithContent('voice.webm', 'not audio at all'),
+            'voice_duration_seconds' => 3,
+        ])->assertUnprocessable()->assertJsonValidationErrors('voice');
+
+        $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'voice' => UploadedFile::fake()->createWithContent('voice.webm', $this->webmVoiceBytes()),
+        ])->assertUnprocessable()->assertJsonValidationErrors('voice_duration_seconds');
+
+        $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'voice' => UploadedFile::fake()->createWithContent('voice.webm', $this->webmVoiceBytes()),
+            'voice_duration_seconds' => 3,
+            'body' => 'Voice notes cannot carry captions',
+        ])->assertUnprocessable()->assertJsonValidationErrors('voice');
+
+        $this->assertSame(0, Message::count());
+    }
+
+    public function test_group_calls_are_logged_and_appear_in_member_call_history(): void
+    {
+        $owner = User::factory()->create();
+        $member = User::factory()->create();
+        $outsider = User::factory()->create();
+        $group = Conversation::create([
+            'type' => 'group',
+            'name' => 'Launch team',
+            'created_by_user_id' => $owner->id,
+        ]);
+        $group->participants()->attach([$owner->id, $member->id]);
+        $call = [
+            'call_id' => '33333333-3333-4333-8333-333333333333',
+            'caller_id' => $owner->id,
+            'status' => 'completed',
+            'media_type' => 'video',
+            'duration_seconds' => 42,
+        ];
+
+        Sanctum::actingAs($member);
+        $this->postJson("/api/conversations/{$group->id}/calls", $call)
+            ->assertCreated()
+            ->assertJsonPath('call.status', 'completed')
+            ->assertJsonPath('sender.id', $owner->id);
+        $this->postJson("/api/conversations/{$group->id}/calls", [...$call, 'call_id' => '44444444-4444-4444-8444-444444444444', 'caller_id' => $outsider->id])
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors('caller_id');
+        $this->getJson('/api/call-history')
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.contact', null)
+            ->assertJsonPath('data.0.group.id', $group->id)
+            ->assertJsonPath('data.0.group.name', 'Launch team')
+            ->assertJsonPath('data.0.direction', 'incoming')
+            ->assertJsonPath('data.0.duration_seconds', 42);
+
+        Sanctum::actingAs($outsider);
+        $this->postJson("/api/conversations/{$group->id}/calls", $call)->assertNotFound();
+        $this->getJson('/api/call-history')->assertOk()->assertJsonCount(0, 'data');
+    }
+
+    /**
+     * A minimal WebM (EBML) header as produced by MediaRecorder for audio/webm;codecs=opus.
+     */
+    private function webmVoiceBytes(): string
+    {
+        $ebmlBody = "\x42\x86\x81\x01"   // EBMLVersion 1
+            ."\x42\xF7\x81\x01"          // EBMLReadVersion 1
+            ."\x42\xF2\x81\x04"          // EBMLMaxIDLength 4
+            ."\x42\xF3\x81\x08"          // EBMLMaxSizeLength 8
+            ."\x42\x82\x84webm"          // DocType "webm"
+            ."\x42\x87\x81\x04"          // DocTypeVersion 4
+            ."\x42\x85\x81\x02";         // DocTypeReadVersion 2
+
+        return "\x1A\x45\xDF\xA3".chr(0x80 | strlen($ebmlBody)).$ebmlBody
+            ."\x18\x53\x80\x67\x01\xFF\xFF\xFF\xFF\xFF\xFF\xFF"
+            .str_repeat("\0", 256);
+    }
+
     private function makeConversation(): array
     {
         $first = User::factory()->create();

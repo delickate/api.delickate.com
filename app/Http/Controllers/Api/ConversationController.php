@@ -17,6 +17,8 @@ use Illuminate\Validation\ValidationException;
 
 class ConversationController extends Controller
 {
+    private const MAX_VOICE_SECONDS = 600;
+
     public function index(Request $request): JsonResponse
     {
         $userId = (int) $request->user()->id;
@@ -359,12 +361,16 @@ class ConversationController extends Controller
         $callHistory = Message::query()
             ->where('type', 'call')
             ->whereHas('conversation', fn ($query) => $query
-                ->where('type', 'direct')
-                ->where(fn ($participantQuery) => $participantQuery
-                    ->where('low_user_id', $userId)
-                    ->orWhere('high_user_id', $userId)))
+                ->where(fn ($directQuery) => $directQuery
+                    ->where('type', 'direct')
+                    ->where(fn ($participantQuery) => $participantQuery
+                        ->where('low_user_id', $userId)
+                        ->orWhere('high_user_id', $userId)))
+                ->orWhere(fn ($groupQuery) => $groupQuery
+                    ->where('type', 'group')
+                    ->whereHas('participants', fn ($memberQuery) => $memberQuery->whereKey($userId))))
             ->with([
-                'conversation:id,low_user_id,high_user_id',
+                'conversation:id,type,name,low_user_id,high_user_id',
                 'conversation.lowUser:id,name,phone,profile_picture_path',
                 'conversation.highUser:id,name,phone,profile_picture_path',
             ])
@@ -373,14 +379,21 @@ class ConversationController extends Controller
 
         $callHistory->getCollection()->transform(function (Message $message) use ($userId) {
             $conversation = $message->conversation;
-            $otherUser = (int) $conversation->low_user_id === $userId
-                ? $conversation->highUser
-                : $conversation->lowUser;
+            $isGroup = $conversation->type === 'group';
+            $otherUser = $isGroup
+                ? null
+                : ((int) $conversation->low_user_id === $userId
+                    ? $conversation->highUser
+                    : $conversation->lowUser);
 
             return [
                 'id' => $message->id,
                 'conversation_id' => $message->conversation_id,
                 'contact' => $this->publicUser($otherUser),
+                'group' => $isGroup ? [
+                    'id' => $conversation->id,
+                    'name' => $conversation->name,
+                ] : null,
                 'direction' => (int) $message->sender_id === $userId ? 'outgoing' : 'incoming',
                 'status' => $message->call_status,
                 'media_type' => $message->call_media_type,
@@ -398,7 +411,7 @@ class ConversationController extends Controller
         if (! $this->userIsParticipant($conversation, $userId)) {
             return response()->json(['message' => 'Conversation not found.'], 404);
         }
-        if ($conversation->type === 'group' ||
+        if ($conversation->type !== 'group' &&
             $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
             return response()->json(['message' => 'This direct conversation is unavailable.'], 404);
         }
@@ -410,8 +423,7 @@ class ConversationController extends Controller
             'media_type' => ['required', 'in:audio,video'],
             'duration_seconds' => ['required', 'integer', 'min:0', 'max:86400'],
         ]);
-        $participantIds = [(int) $conversation->low_user_id, (int) $conversation->high_user_id];
-        if (! in_array((int) $validated['caller_id'], $participantIds, true)) {
+        if (! $this->userIsParticipant($conversation, (int) $validated['caller_id'])) {
             throw ValidationException::withMessages([
                 'caller_id' => ['The caller must be a participant in this conversation.'],
             ]);
@@ -471,8 +483,10 @@ class ConversationController extends Controller
         }
 
         $validated = $request->validate([
-            'body' => ['required_without:attachment', 'nullable', 'string', 'max:10000'],
-            'attachment' => ['required_without:body', 'nullable', 'file', 'max:5120', 'mimes:jpg,jpeg,png,gif,webp,pdf,txt'],
+            'body' => ['required_without_all:attachment,voice', 'nullable', 'string', 'max:10000'],
+            'attachment' => ['required_without_all:body,voice', 'nullable', 'file', 'max:5120', 'mimes:jpg,jpeg,png,gif,webp,pdf,txt'],
+            'voice' => ['nullable', 'file', 'max:5120', 'prohibits:attachment,body'],
+            'voice_duration_seconds' => ['required_with:voice', 'nullable', 'integer', 'min:1', 'max:'.self::MAX_VOICE_SECONDS],
             'type' => ['sometimes', 'in:text'],
             'reply_to_message_id' => ['sometimes', 'nullable', 'integer', 'exists:messages,id'],
         ]);
@@ -483,20 +497,27 @@ class ConversationController extends Controller
             ]);
         }
 
-        $file = $request->file('attachment');
-        $attachment = $file ? $this->validatedAttachment($file) : null;
+        $voice = $request->file('voice');
+        $file = $voice ?? $request->file('attachment');
+        $attachment = $voice
+            ? $this->validatedVoice($voice)
+            : ($file ? $this->validatedAttachment($file) : null);
+        $type = $voice ? 'voice' : ($file ? 'file' : 'text');
         $storedPath = null;
 
         try {
-            $message = DB::transaction(function () use ($conversation, $userId, $validated, $file, $attachment, $replyToId, &$storedPath) {
+            $message = DB::transaction(function () use ($conversation, $userId, $validated, $file, $attachment, $type, $replyToId, &$storedPath) {
                 $message = $conversation->messages()->create([
                     'sender_id' => $userId,
                     'reply_to_message_id' => $replyToId,
-                    'body' => $validated['body'] ?? null,
-                    'type' => $file ? 'file' : 'text',
+                    'body' => $type === 'voice' ? null : ($validated['body'] ?? null),
+                    'type' => $type,
                     'attachment_name' => $attachment['name'] ?? null,
                     'attachment_mime' => $attachment['mime'] ?? null,
                     'attachment_size' => $file?->getSize(),
+                    'voice_duration_seconds' => $type === 'voice'
+                        ? (int) $validated['voice_duration_seconds']
+                        : null,
                 ]);
 
                 if ($file) {
@@ -578,6 +599,7 @@ class ConversationController extends Controller
                     'attachment_name' => $message->attachment_name,
                     'attachment_mime' => $message->attachment_mime,
                     'attachment_size' => $message->attachment_size,
+                    'voice_duration_seconds' => $message->voice_duration_seconds,
                     'is_forwarded' => true,
                 ]);
                 $targetConversation->touch();
@@ -631,6 +653,7 @@ class ConversationController extends Controller
                 'attachment_name' => null,
                 'attachment_mime' => null,
                 'attachment_size' => null,
+                'voice_duration_seconds' => null,
                 'deleted_for_everyone_at' => now(),
             ])->save();
         });
@@ -781,6 +804,7 @@ class ConversationController extends Controller
                         'name' => $reply->sender->name,
                     ],
                     'body' => $reply->body,
+                    'type' => $reply->type,
                     'attachment' => $reply->attachment_path ? ['name' => $reply->attachment_name] : null,
                     'deleted_for_everyone_at' => $reply->deleted_for_everyone_at,
                     'unavailable' => false,
@@ -793,6 +817,9 @@ class ConversationController extends Controller
                 'size' => $message->attachment_size,
             ] : null,
             'is_forwarded' => (bool) $message->is_forwarded,
+            'voice' => $message->type === 'voice' && $message->attachment_path ? [
+                'duration_seconds' => (int) $message->voice_duration_seconds,
+            ] : null,
             'call' => $message->type === 'call' ? [
                 'status' => $message->call_status,
                 'media_type' => $message->call_media_type,
@@ -900,6 +927,49 @@ class ConversationController extends Controller
             'name' => ($stem ?: 'attachment').'.'.$extension,
             'mime' => $allowed[$extension][0],
         ];
+    }
+
+    /**
+     * Voice notes are identified by their container signature, not the client
+     * filename, and are stored under a fixed name so they can never be confused
+     * with an arbitrary uploaded file.
+     */
+    private function validatedVoice(\Illuminate\Http\UploadedFile $file): array
+    {
+        $header = file_get_contents($file->getRealPath(), false, null, 0, 64);
+
+        if ($header === false) {
+            throw ValidationException::withMessages([
+                'voice' => ['The voice message could not be read. Please record it again.'],
+            ]);
+        }
+
+        // Each format is checked by its container signature plus a structural
+        // marker, rather than by libmagic, whose labels for audio-only WebM vary.
+        $formats = [
+            // EBML header whose DocType element is "webm".
+            'webm' => ['audio/webm', str_starts_with($header, "\x1A\x45\xDF\xA3")
+                && str_contains($header, "\x42\x82\x84webm")],
+            // Ogg page carrying an Opus or Vorbis identification header.
+            'ogg' => ['audio/ogg', str_starts_with($header, 'OggS')
+                && (str_contains($header, 'OpusHead') || str_contains($header, "\x01vorbis"))],
+            // ISO base media file with an audio-capable major brand.
+            'm4a' => ['audio/mp4', substr($header, 4, 4) === 'ftyp'
+                && in_array(substr($header, 8, 4), ['M4A ', 'mp42', 'isom', 'iso5', 'dash'], true)],
+        ];
+
+        foreach ($formats as $extension => [$mime, $matches]) {
+            if ($matches) {
+                return [
+                    'name' => 'voice-message.'.$extension,
+                    'mime' => $mime,
+                ];
+            }
+        }
+
+        throw ValidationException::withMessages([
+            'voice' => ['The voice message must be a WebM, Ogg, or M4A audio recording.'],
+        ]);
     }
 
     private function hasImageType(\Illuminate\Http\UploadedFile $file, int $expectedType): bool
