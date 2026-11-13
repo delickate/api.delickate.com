@@ -14,6 +14,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\URL;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
@@ -330,6 +331,91 @@ class ConversationController extends Controller
             'conversation_id' => $conversation->id,
             'member' => $this->publicUser($member),
         ], 201);
+    }
+
+    /** Any member can change the group picture (like WhatsApp's default). */
+    public function updateGroupIcon(Request $request, Conversation $conversation): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        if ($conversation->type !== 'group' || ! $this->userIsParticipant($conversation, $userId)) {
+            return response()->json(['message' => 'You are not a member of this group.'], 403);
+        }
+
+        $validated = $request->validate([
+            'icon' => ['required', 'image', 'mimes:jpg,jpeg,png,gif,webp', 'max:5120'],
+        ]);
+        $file = $validated['icon'];
+        $extension = strtolower($file->extension() ?: 'jpg');
+        if (! in_array($extension, ['jpg', 'jpeg', 'png', 'gif', 'webp'], true)) {
+            $extension = 'jpg';
+        }
+
+        $storedPath = $file->storeAs('group-icons/'.$conversation->id, Str::uuid().'.'.$extension, ['disk' => 'private']);
+        if (! $storedPath) {
+            return response()->json(['message' => 'The group icon could not be saved.'], 500);
+        }
+
+        $previousPath = $conversation->icon_path;
+        $conversation->forceFill(['icon_path' => $storedPath])->save();
+        if ($previousPath) {
+            Storage::disk('private')->delete($previousPath);
+        }
+
+        Realtime::push($this->participantIds($conversation), 'conversation.changed', ['conversation_id' => $conversation->id]);
+
+        return response()->json([
+            'message' => 'Group icon updated.',
+            'conversation_id' => $conversation->id,
+            'icon_url' => $this->groupIconUrl($conversation),
+        ]);
+    }
+
+    public function removeGroupIcon(Request $request, Conversation $conversation): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        if ($conversation->type !== 'group' || ! $this->userIsParticipant($conversation, $userId)) {
+            return response()->json(['message' => 'You are not a member of this group.'], 403);
+        }
+
+        if ($conversation->icon_path) {
+            Storage::disk('private')->delete($conversation->icon_path);
+            $conversation->forceFill(['icon_path' => null])->save();
+            Realtime::push($this->participantIds($conversation), 'conversation.changed', ['conversation_id' => $conversation->id]);
+        }
+
+        return response()->json(['message' => 'Group icon removed.', 'conversation_id' => $conversation->id, 'icon_url' => null]);
+    }
+
+    /** Served through a signed URL so it works in <img> tags without a token. */
+    public function groupIcon(Conversation $conversation)
+    {
+        abort_unless(
+            $conversation->type === 'group' &&
+                $conversation->icon_path &&
+                Storage::disk('private')->exists($conversation->icon_path),
+            404
+        );
+
+        return Storage::disk('private')->response(
+            $conversation->icon_path,
+            null,
+            ['Cache-Control' => 'private, max-age=86400'],
+            'inline'
+        );
+    }
+
+    private function groupIconUrl(Conversation $conversation): ?string
+    {
+        if (! $conversation->icon_path) {
+            return null;
+        }
+
+        // Signed on the path only, so it still validates behind proxies; the
+        // version changes with every new picture so clients never show a stale one.
+        return url(URL::signedRoute('group-icons.show', [
+            'conversation' => $conversation->id,
+            'v' => substr(hash('sha256', $conversation->icon_path), 0, 16),
+        ], null, false));
     }
 
     public function leaveGroup(Request $request, Conversation $conversation): JsonResponse
@@ -1181,6 +1267,7 @@ class ConversationController extends Controller
 
         if ($conversationType === 'group') {
             $payload['name'] = $conversation->name;
+            $payload['icon_url'] = $this->groupIconUrl($conversation);
             $payload['participants'] = $conversation->participants
                 ->map(fn (User $user) => $this->publicUser($user))
                 ->values()

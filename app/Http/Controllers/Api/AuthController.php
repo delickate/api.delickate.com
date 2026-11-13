@@ -118,6 +118,21 @@ class AuthController extends Controller
         ]);
     }
 
+    public function removeProfilePicture(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $previousPicturePath = $user->profile_picture_path;
+        if ($previousPicturePath) {
+            $user->update(['profile_picture_path' => null]);
+            Storage::disk('public')->delete($previousPicturePath);
+        }
+
+        return response()->json([
+            'message' => 'Profile picture removed.',
+            'user' => $this->userData($user->fresh()),
+        ]);
+    }
+
     public function profilePicture(User $user)
     {
         abort_unless(

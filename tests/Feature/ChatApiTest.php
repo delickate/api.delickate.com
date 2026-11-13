@@ -192,6 +192,13 @@ class ChatApiTest extends TestCase
         $this->get($user->avatar_url)
             ->assertOk()
             ->assertHeader('Content-Type', 'image/png');
+
+        $storedPath = $user->profile_picture_path;
+        $this->deleteJson('/api/user/profile-picture')
+            ->assertOk()
+            ->assertJsonPath('user.avatar_url', null);
+        $this->assertNull($user->fresh()->profile_picture_path);
+        Storage::disk('public')->assertMissing($storedPath);
     }
 
     public function test_only_creator_can_remove_members_and_other_members_can_leave(): void
@@ -1097,6 +1104,43 @@ class ChatApiTest extends TestCase
         $this->postJson("/api/conversations/{$group->id}/messages", [
             'body' => $this->encryptedEnvelope(), 'encrypted' => true, 'key_version' => 3,
         ])->assertCreated();
+    }
+
+    public function test_group_members_can_change_and_remove_the_group_icon(): void
+    {
+        Storage::fake('private');
+        $owner = User::factory()->create();
+        $member = User::factory()->create();
+        $outsider = User::factory()->create();
+        $group = Conversation::create(['type' => 'group', 'name' => 'Team', 'created_by_user_id' => $owner->id]);
+        $group->participants()->attach([$owner->id, $member->id]);
+
+        Sanctum::actingAs($outsider);
+        $this->post("/api/groups/{$group->id}/icon", ['icon' => UploadedFile::fake()->image('icon.png')], ['Accept' => 'application/json'])
+            ->assertForbidden();
+
+        Sanctum::actingAs($member);
+        $this->post("/api/groups/{$group->id}/icon", ['icon' => UploadedFile::fake()->create('notes.pdf', 10, 'application/pdf')], ['Accept' => 'application/json'])
+            ->assertUnprocessable();
+        $iconUrl = $this->post("/api/groups/{$group->id}/icon", ['icon' => UploadedFile::fake()->image('icon.png', 300, 300)], ['Accept' => 'application/json'])
+            ->assertOk()
+            ->json('icon_url');
+        $this->assertNotNull($iconUrl);
+        $firstPath = $group->fresh()->icon_path;
+        Storage::disk('private')->assertExists($firstPath);
+
+        // Every member sees it in their chat list, and the signed URL serves it.
+        Sanctum::actingAs($owner);
+        $listed = collect($this->getJson('/api/conversations')->assertOk()->json('data'))->firstWhere('id', $group->id);
+        $this->assertSame($iconUrl, $listed['icon_url']);
+        $this->get($iconUrl)->assertOk();
+        $this->get(preg_replace('/signature=[^&]+/', 'signature=forged', $iconUrl))->assertForbidden();
+
+        // Replacing deletes the old file; removing clears it.
+        $this->post("/api/groups/{$group->id}/icon", ['icon' => UploadedFile::fake()->image('new.jpg')], ['Accept' => 'application/json'])->assertOk();
+        Storage::disk('private')->assertMissing($firstPath);
+        $this->deleteJson("/api/groups/{$group->id}/icon")->assertOk()->assertJsonPath('icon_url', null);
+        $this->assertNull($group->fresh()->icon_path);
     }
 
     private function encryptedEnvelope(): string

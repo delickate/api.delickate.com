@@ -14,6 +14,7 @@ class Conversation extends Model
         'high_user_id',
         'type',
         'name',
+        'icon_path',
         'created_by_user_id',
         'request_status',
         'requested_by_user_id',
