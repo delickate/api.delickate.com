@@ -1355,6 +1355,47 @@ class ChatApiTest extends TestCase
         $this->assertSame($messageId, $read['payload']['last_read_message_id']);
     }
 
+    public function test_clearing_a_chat_hides_it_only_for_that_person(): void
+    {
+        [$clearer, $other, $conversation] = $this->makeConversation();
+        Sanctum::actingAs($other);
+        $first = $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => 'one'])->json('id');
+        $this->postJson("/api/conversations/{$conversation->id}/messages/{$first}/pin")->assertOk();
+        $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => 'two'])->assertCreated();
+
+        Sanctum::actingAs($clearer);
+        $this->postJson("/api/conversations/{$conversation->id}/clear")
+            ->assertOk()
+            ->assertJsonPath('message', 'Chat cleared for you.');
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()
+            ->assertJsonCount(0, 'data')
+            ->assertJsonCount(0, 'pinned');
+        $this->getJson('/api/conversations')
+            ->assertOk()
+            ->assertJsonPath('data.0.last_message', null)
+            ->assertJsonPath('data.0.unread_count', 0);
+
+        // The other person still sees everything.
+        Sanctum::actingAs($other);
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()
+            ->assertJsonCount(2, 'data')
+            ->assertJsonCount(1, 'pinned');
+
+        // New messages after clearing show up as normal.
+        $third = $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => 'three'])->json('id');
+        Sanctum::actingAs($clearer);
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()
+            ->assertJsonCount(1, 'data')
+            ->assertJsonPath('data.0.id', $third);
+        $this->getJson('/api/conversations')->assertOk()->assertJsonPath('data.0.unread_count', 1);
+
+        Sanctum::actingAs(User::factory()->create());
+        $this->postJson("/api/conversations/{$conversation->id}/clear")->assertNotFound();
+    }
+
     public function test_voice_messages_are_validated(): void
     {
         Storage::fake('private');

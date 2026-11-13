@@ -23,6 +23,11 @@ class ConversationController extends Controller
 
     private const MAX_PINNED_MESSAGES = 3;
 
+    /** Hides messages this person removed with "Clear chat" (from them only). */
+    private const NOT_CLEARED = 'messages.id > COALESCE((SELECT conversation_clears.cleared_up_to_message_id'
+        .' FROM conversation_clears WHERE conversation_clears.conversation_id = messages.conversation_id'
+        .' AND conversation_clears.user_id = ?), 0)';
+
     /**
      * Block states for the current request: other user id => 'by_me' | 'by_them'.
      * Keyed by request, because Laravel may reuse a controller across requests.
@@ -51,6 +56,7 @@ class ConversationController extends Controller
                 'participants:id,name,phone,profile_picture_path',
                 'messages' => fn ($query) => $query
                     ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId))
+                ->whereRaw(self::NOT_CLEARED, [$userId])
                     ->with([
                         'sender:id,name,profile_picture_path',
                         'replyTo.sender:id,name,profile_picture_path',
@@ -116,6 +122,7 @@ class ConversationController extends Controller
             'participants:id,name,phone,profile_picture_path',
             'messages' => fn ($query) => $query
                 ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId))
+                ->whereRaw(self::NOT_CLEARED, [$userId])
                 ->with([
                     'sender:id,name,profile_picture_path',
                     'replyTo.sender:id,name,profile_picture_path',
@@ -126,6 +133,42 @@ class ConversationController extends Controller
         ])->loadCount(['messages as unread_count' => $this->unreadMessages($userId)]);
 
         return response()->json($this->conversationData($conversation, $userId), 201);
+    }
+
+    /**
+     * Clears the chat for the requesting person only: everything sent so far is
+     * hidden from them, while the other participants keep seeing it.
+     */
+    public function clear(Request $request, Conversation $conversation): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        if (! $this->userIsParticipant($conversation, $userId)) {
+            return response()->json(['message' => 'Conversation not found.'], 404);
+        }
+
+        $latestId = (int) $conversation->messages()->max('id');
+        if ($latestId > 0) {
+            $now = now();
+            DB::transaction(function () use ($conversation, $userId, $latestId, $now) {
+                DB::table('conversation_clears')->updateOrInsert(
+                    ['conversation_id' => $conversation->id, 'user_id' => $userId],
+                    ['cleared_up_to_message_id' => $latestId, 'created_at' => $now, 'updated_at' => $now],
+                );
+                // Nothing that was cleared should still count as unread.
+                DB::table('conversation_reads')->updateOrInsert(
+                    ['conversation_id' => $conversation->id, 'user_id' => $userId],
+                    ['last_read_message_id' => $latestId, 'read_at' => $now, 'created_at' => $now, 'updated_at' => $now],
+                );
+            });
+        }
+        // Update this person's other devices.
+        Realtime::push([$userId], 'conversation.changed', ['conversation_id' => $conversation->id]);
+
+        return response()->json([
+            'message' => 'Chat cleared for you.',
+            'conversation_id' => $conversation->id,
+            'cleared_up_to_message_id' => $latestId,
+        ]);
     }
 
     public function respondToRequest(Request $request, Conversation $conversation, string $action): JsonResponse
@@ -208,6 +251,7 @@ class ConversationController extends Controller
             'participants:id,name,phone,profile_picture_path',
             'messages' => fn ($query) => $query
                 ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId))
+                ->whereRaw(self::NOT_CLEARED, [$userId])
                 ->with([
                     'sender:id,name,profile_picture_path',
                     'replyTo.sender:id,name,profile_picture_path',
@@ -220,7 +264,8 @@ class ConversationController extends Controller
                 ->where('sender_id', '!=', $userId)
                 ->whereNull('read_at')
                 ->whereNull('deleted_for_everyone_at')
-                ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId)),
+                ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId))
+                ->whereRaw(self::NOT_CLEARED, [$userId]),
         ]);
 
         Realtime::push($this->participantIds($conversation), 'conversation.changed', ['conversation_id' => $conversation->id]);
@@ -445,6 +490,7 @@ class ConversationController extends Controller
 
         $query = $conversation->messages()
             ->whereDoesntHave('hiddenFromUsers', fn ($query) => $query->where('users.id', $userId))
+            ->whereRaw(self::NOT_CLEARED, [$userId])
             ->with([
                 'sender:id,name,phone,profile_picture_path',
                 'replyTo.sender:id,name,profile_picture_path',
@@ -479,6 +525,7 @@ class ConversationController extends Controller
         $pinned = $conversation->messages()
             ->whereNotNull('pinned_at')
             ->whereDoesntHave('hiddenFromUsers', fn ($query) => $query->where('users.id', $userId))
+            ->whereRaw(self::NOT_CLEARED, [$userId])
             ->with('sender:id,name,phone,profile_picture_path')
             ->orderByDesc('pinned_at')
             ->get()
@@ -1233,7 +1280,8 @@ class ConversationController extends Controller
                 [$userId]
             )
             ->whereNull('deleted_for_everyone_at')
-            ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId));
+            ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId))
+                ->whereRaw(self::NOT_CLEARED, [$userId]);
     }
 
     /** @return array<int, int> */

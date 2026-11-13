@@ -57,6 +57,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/groups/{conversation}/leave', [ConversationController::class, 'leaveGroup']);
     Route::delete('/groups/{conversation}/members/{user}', [ConversationController::class, 'removeMember']);
     Route::post('/conversations', [ConversationController::class, 'store']);
+    Route::post('/conversations/{conversation}/clear', [ConversationController::class, 'clear']);
     Route::post('/conversations/{conversation}/request/{action}', [ConversationController::class, 'respondToRequest'])
         ->whereIn('action', ['accept', 'decline']);
     Route::post('/conversations/{conversation}/messages/{message}/pin', [ConversationController::class, 'pinMessage']);
