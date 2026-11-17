@@ -1,5 +1,7 @@
 <?php
 
+use App\Http\Controllers\Api\ApiCollectionController;
+use App\Http\Controllers\Api\ApiFolderController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ConversationController;
 use App\Http\Controllers\Api\FriendController;
@@ -83,4 +85,17 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/conversations/{conversation}/messages/{message}/attachment', [ConversationController::class, 'downloadAttachment']);
     Route::post('/conversations/{conversation}/delivered', [ConversationController::class, 'markDelivered']);
     Route::post('/conversations/{conversation}/read', [ConversationController::class, 'markRead']);
+
+    // API Collections desktop app: nested folders and exportable collections.
+    Route::get('/workspace', [ApiFolderController::class, 'workspace']);
+    Route::post('/folders', [ApiFolderController::class, 'store']);
+    Route::patch('/folders/{folder}', [ApiFolderController::class, 'update']);
+    Route::delete('/folders/{folder}', [ApiFolderController::class, 'destroy']);
+    Route::post('/collections', [ApiCollectionController::class, 'store']);
+    Route::post('/collections/import', [ApiCollectionController::class, 'import'])->middleware('throttle:30,1');
+    Route::get('/collections/{collection}', [ApiCollectionController::class, 'show']);
+    Route::patch('/collections/{collection}', [ApiCollectionController::class, 'update']);
+    Route::delete('/collections/{collection}', [ApiCollectionController::class, 'destroy']);
+    Route::post('/collections/{collection}/duplicate', [ApiCollectionController::class, 'duplicate']);
+    Route::get('/collections/{collection}/export', [ApiCollectionController::class, 'export']);
 });
