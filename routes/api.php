@@ -28,6 +28,8 @@ Route::get('/', function () {
 
 Route::post('/auth/register', [AuthController::class, 'register'])->middleware('throttle:10,1');
 Route::post('/auth/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
+Route::post('/auth/forgot-password', [AuthController::class, 'forgotPassword'])->middleware('throttle:5,1');
+Route::post('/auth/reset-password', [AuthController::class, 'resetPassword'])->middleware('throttle:6,1');
 Route::get('/profile-pictures/{user}', [AuthController::class, 'profilePicture'])
     ->name('profile-pictures.show');
 // Group icons are only reachable through the signed URL handed to members.
@@ -41,6 +43,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/user', fn (Request $request) => $request->user());
     Route::post('/user/profile-picture', [AuthController::class, 'updateProfilePicture']);
     Route::delete('/user/profile-picture', [AuthController::class, 'removeProfilePicture']);
+    Route::patch('/user/profile', [AuthController::class, 'updateProfile']);
+    Route::patch('/user/password', [AuthController::class, 'updatePassword']);
     Route::patch('/user/settings', [AuthController::class, 'updateSettings']);
 
     Route::get('/friends', [FriendController::class, 'index']);

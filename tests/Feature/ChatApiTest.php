@@ -1534,4 +1534,119 @@ class ChatApiTest extends TestCase
 
         return [$first, $second, $conversation];
     }
+
+    public function test_user_can_update_display_name(): void
+    {
+        $user = User::factory()->create(['name' => 'Old Name']);
+        Sanctum::actingAs($user);
+
+        $this->patchJson('/api/user/profile', ['name' => '  New Name  '])
+            ->assertOk()
+            ->assertJsonPath('user.name', 'New Name');
+
+        $this->assertSame('New Name', $user->fresh()->name);
+
+        $this->patchJson('/api/user/profile', ['name' => ''])->assertUnprocessable();
+    }
+
+    public function test_user_can_change_password_and_other_sessions_are_revoked(): void
+    {
+        $user = User::factory()->create([
+            'phone' => '+15557770001',
+            'password' => 'old-password-123',
+        ]);
+        $currentToken = $user->createToken('this-device')->plainTextToken;
+        $otherToken = $user->createToken('other-device')->plainTextToken;
+
+        // Wrong current password is rejected.
+        $this->withHeader('Authorization', 'Bearer '.$currentToken)
+            ->patchJson('/api/user/password', [
+                'current_password' => 'not-the-password',
+                'password' => 'brand-new-password',
+            ])->assertUnprocessable();
+
+        $this->withHeader('Authorization', 'Bearer '.$currentToken)
+            ->patchJson('/api/user/password', [
+                'current_password' => 'old-password-123',
+                'password' => 'brand-new-password',
+            ])->assertOk();
+
+        $this->assertTrue(\Illuminate\Support\Facades\Hash::check('brand-new-password', $user->fresh()->password));
+
+        // The other device's token row was deleted by the password change.
+        $this->assertDatabaseMissing('personal_access_tokens', [
+            'id' => explode('|', $otherToken)[0],
+        ]);
+        // This device's token survives.
+        $this->assertDatabaseHas('personal_access_tokens', [
+            'id' => explode('|', $currentToken)[0],
+        ]);
+
+        // The auth guard caches the resolved user across requests within a single
+        // test, so clear it before re-checking auth with a different token.
+        $this->app['auth']->forgetGuards();
+        $this->withHeader('Authorization', 'Bearer '.$otherToken)
+            ->getJson('/api/user')
+            ->assertUnauthorized();
+
+        $this->app['auth']->forgetGuards();
+        $this->withHeader('Authorization', 'Bearer '.$currentToken)
+            ->getJson('/api/user')
+            ->assertOk();
+
+        // The new password works for login.
+        $this->postJson('/api/auth/login', [
+            'phone' => $user->phone,
+            'password' => 'brand-new-password',
+        ])->assertOk();
+    }
+
+    public function test_forgot_password_stores_code_and_reset_changes_password(): void
+    {
+        \Illuminate\Support\Facades\Mail::fake();
+        $user = User::factory()->create([
+            'phone' => '+15559990001',
+            'email' => 'reset.me@example.com',
+            'password' => 'original-password',
+        ]);
+        $oldToken = $user->createToken('device')->plainTextToken;
+
+        $this->postJson('/api/auth/forgot-password', ['phone' => '+15559990001'])
+            ->assertOk()
+            ->assertJsonPath('email_hint', 'r****e@e***.com');
+
+        $this->assertDatabaseHas('password_reset_tokens', ['email' => 'reset.me@example.com']);
+
+        // An unknown number returns the same shape without leaking existence.
+        $this->postJson('/api/auth/forgot-password', ['phone' => '+15550000000'])
+            ->assertOk()
+            ->assertJsonPath('email_hint', null);
+
+        // Simulate the emailed code by writing a known one.
+        \Illuminate\Support\Facades\DB::table('password_reset_tokens')->updateOrInsert(
+            ['email' => 'reset.me@example.com'],
+            ['token' => \Illuminate\Support\Facades\Hash::make('123456'), 'created_at' => now()]
+        );
+
+        // A wrong code is rejected.
+        $this->postJson('/api/auth/reset-password', [
+            'phone' => '+15559990001', 'code' => '000000', 'password' => 'fresh-password-1',
+        ])->assertUnprocessable();
+
+        $this->postJson('/api/auth/reset-password', [
+            'phone' => '+15559990001', 'code' => '123456', 'password' => 'fresh-password-1',
+        ])->assertOk();
+
+        $this->assertTrue(\Illuminate\Support\Facades\Hash::check('fresh-password-1', $user->fresh()->password));
+        $this->assertDatabaseMissing('password_reset_tokens', ['email' => 'reset.me@example.com']);
+
+        // Reset revokes all existing sessions.
+        $this->withHeader('Authorization', 'Bearer '.$oldToken)
+            ->getJson('/api/user')
+            ->assertUnauthorized();
+
+        $this->postJson('/api/auth/login', [
+            'phone' => '+15559990001', 'password' => 'fresh-password-1',
+        ])->assertOk();
+    }
 }
