@@ -67,6 +67,7 @@ class ConversationController extends Controller
                 'messages' => fn ($query) => $query
                     ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId))
                 ->whereRaw(self::NOT_CLEARED, [$userId])
+                    ->where(fn ($expiry) => $expiry->whereNull('expires_at')->orWhere('expires_at', '>', now()))
                     ->with([
                         'sender:id,name,profile_picture_path',
                         'replyTo.sender:id,name,profile_picture_path',
