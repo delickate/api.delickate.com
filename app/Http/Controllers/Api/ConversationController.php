@@ -24,13 +24,24 @@ class ConversationController extends Controller
 
     private const MAX_PINNED_MESSAGES = 3;
 
-    /** Disappearing-message timer choices, in seconds (0 = off). */
+    /** Chat-wide disappearing-message timer choices, in seconds (0 = off). */
     public const DISAPPEARING_SECONDS_OPTIONS = [
         0,          // off
         3600,       // 1 hour
         86400,      // 24 hours
         604800,     // 7 days
         7776000,    // 90 days
+    ];
+
+    /** Per-message self-destruct timer choices, in seconds (0 = none). */
+    public const MESSAGE_EXPIRY_SECONDS_OPTIONS = [
+        0,          // none
+        60,         // 1 minute
+        300,        // 5 minutes
+        900,        // 15 minutes
+        3600,       // 1 hour
+        28800,      // 8 hours
+        86400,      // 24 hours
     ];
 
     /** Hides messages this person removed with "Clear chat" (from them only). */
@@ -678,6 +689,22 @@ class ConversationController extends Controller
         return $seconds > 0 ? now()->addSeconds($seconds) : null;
     }
 
+    /**
+     * Combines the chat-wide timer with a per-message one. A message never lives
+     * longer than either applies, so we keep whichever expiry comes first.
+     */
+    private function earliestExpiry(?\Illuminate\Support\Carbon $a, ?\Illuminate\Support\Carbon $b): ?\Illuminate\Support\Carbon
+    {
+        if ($a === null) {
+            return $b;
+        }
+        if ($b === null) {
+            return $a;
+        }
+
+        return $a->lt($b) ? $a : $b;
+    }
+
     /** Hard-deletes messages whose disappearing timer has passed, with their files. */
     private function purgeExpired(Conversation $conversation): void
     {
@@ -844,6 +871,8 @@ class ConversationController extends Controller
             'reply_to_message_id' => ['sometimes', 'nullable', 'integer', 'exists:messages,id'],
             'encrypted' => ['sometimes', 'boolean'],
             'key_version' => ['exclude_unless:encrypted,true,1', 'required', 'integer', 'min:1'],
+            // Per-message self-destruct timer (in addition to any chat-wide one).
+            'disappearing_seconds' => ['sometimes', 'nullable', 'integer', 'in:'.implode(',', self::MESSAGE_EXPIRY_SECONDS_OPTIONS)],
         ]);
         $encrypted = filter_var($validated['encrypted'] ?? false, FILTER_VALIDATE_BOOLEAN);
         // Plain voice notes cannot carry a caption; encrypted ones carry their key in the body.
@@ -891,8 +920,16 @@ class ConversationController extends Controller
         }
         $storedPath = null;
 
+        // A message expires at the earliest of the chat-wide timer and any
+        // per-message self-destruct timer the sender chose.
+        $messageSeconds = (int) ($validated['disappearing_seconds'] ?? 0);
+        $expiresAt = $this->earliestExpiry(
+            $this->disappearingExpiry($conversation),
+            $messageSeconds > 0 ? now()->addSeconds($messageSeconds) : null,
+        );
+
         try {
-            $message = DB::transaction(function () use ($conversation, $userId, $validated, $file, $attachment, $type, $replyToId, $encrypted, &$storedPath) {
+            $message = DB::transaction(function () use ($conversation, $userId, $validated, $file, $attachment, $type, $replyToId, $encrypted, $expiresAt, &$storedPath) {
                 $message = $conversation->messages()->create([
                     'sender_id' => $userId,
                     'reply_to_message_id' => $replyToId,
@@ -905,7 +942,7 @@ class ConversationController extends Controller
                     'voice_duration_seconds' => $type === 'voice'
                         ? (int) $validated['voice_duration_seconds']
                         : null,
-                    'expires_at' => $this->disappearingExpiry($conversation),
+                    'expires_at' => $expiresAt,
                 ]);
 
                 if ($file) {

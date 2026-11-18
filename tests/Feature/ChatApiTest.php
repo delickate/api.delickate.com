@@ -1695,4 +1695,44 @@ class ChatApiTest extends TestCase
         $this->artisan('messages:purge-expired')->assertSuccessful();
         $this->assertDatabaseMissing('messages', ['id' => $keepId]);
     }
+
+    public function test_per_message_disappearing_timer(): void
+    {
+        [$first, $second, $conversation] = $this->makeConversation();
+        $conversation->update(['type' => 'direct']);
+        Sanctum::actingAs($first);
+
+        // Chat-wide timer stays off, but the sender sets a 15-minute self-destruct.
+        $messageId = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => 'Self-destruct in 15.',
+            'disappearing_seconds' => 900,
+        ])->assertCreated()->json('id');
+
+        $expiresAt = Message::query()->whereKey($messageId)->value('expires_at');
+        $this->assertNotNull($expiresAt);
+        // ~15 minutes from now.
+        $this->assertEqualsWithDelta(900, now()->diffInSeconds($expiresAt), 30);
+
+        // It is gone once its own timer passes, even with no chat-wide timer.
+        $this->travel(16)->minutes();
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()->assertJsonMissing(['id' => $messageId]);
+        $this->assertDatabaseMissing('messages', ['id' => $messageId]);
+
+        // An arbitrary (non-preset) duration is rejected.
+        $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => 'nope', 'disappearing_seconds' => 123,
+        ])->assertUnprocessable();
+
+        // The per-message timer wins when it is shorter than the chat-wide one.
+        $conversation->update(['disappearing_seconds' => 86400]);
+        $shortId = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => 'short', 'disappearing_seconds' => 60,
+        ])->assertCreated()->json('id');
+        $this->assertEqualsWithDelta(
+            60,
+            now()->diffInSeconds(Message::query()->whereKey($shortId)->value('expires_at')),
+            30,
+        );
+    }
 }
