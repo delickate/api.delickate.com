@@ -31,6 +31,7 @@ class Message extends Model
         'key_version',
         'pinned_at',
         'pinned_by_user_id',
+        'expires_at',
     ];
 
     protected $casts = [
@@ -43,6 +44,7 @@ class Message extends Model
         'edited_at' => 'datetime',
         'key_version' => 'integer',
         'pinned_at' => 'datetime',
+        'expires_at' => 'datetime',
     ];
 
     public function setBodyAttribute($value): void

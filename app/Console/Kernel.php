@@ -12,7 +12,10 @@ class Kernel extends ConsoleKernel
      */
     protected function schedule(Schedule $schedule): void
     {
-        // $schedule->command('inspire')->hourly();
+        // Sweep expired disappearing messages. Lazy purge on fetch already removes
+        // them when a chat is opened; this catches chats nobody has opened. Only
+        // runs if the server has the Laravel scheduler wired to cron.
+        $schedule->command('messages:purge-expired')->hourly()->withoutOverlapping();
     }
 
     /**

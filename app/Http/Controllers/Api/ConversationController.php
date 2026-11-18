@@ -24,6 +24,15 @@ class ConversationController extends Controller
 
     private const MAX_PINNED_MESSAGES = 3;
 
+    /** Disappearing-message timer choices, in seconds (0 = off). */
+    public const DISAPPEARING_SECONDS_OPTIONS = [
+        0,          // off
+        3600,       // 1 hour
+        86400,      // 24 hours
+        604800,     // 7 days
+        7776000,    // 90 days
+    ];
+
     /** Hides messages this person removed with "Clear chat" (from them only). */
     private const NOT_CLEARED = 'messages.id > COALESCE((SELECT conversation_clears.cleared_up_to_message_id'
         .' FROM conversation_clears WHERE conversation_clears.conversation_id = messages.conversation_id'
@@ -567,6 +576,9 @@ class ConversationController extends Controller
             return response()->json(['message' => 'Conversation not found.'], 404);
         }
 
+        // Disappearing messages: remove any whose timer has passed before reading.
+        $this->purgeExpired($conversation);
+
         $validated = $request->validate([
             // Cursor paging: messages older than this id (for "load earlier messages").
             'before_id' => ['sometimes', 'integer', 'min:1'],
@@ -577,6 +589,7 @@ class ConversationController extends Controller
         $query = $conversation->messages()
             ->whereDoesntHave('hiddenFromUsers', fn ($query) => $query->where('users.id', $userId))
             ->whereRaw(self::NOT_CLEARED, [$userId])
+            ->where(fn ($expiry) => $expiry->whereNull('expires_at')->orWhere('expires_at', '>', now()))
             ->with([
                 'sender:id,name,phone,profile_picture_path',
                 'replyTo.sender:id,name,profile_picture_path',
@@ -612,6 +625,7 @@ class ConversationController extends Controller
             ->whereNotNull('pinned_at')
             ->whereDoesntHave('hiddenFromUsers', fn ($query) => $query->where('users.id', $userId))
             ->whereRaw(self::NOT_CLEARED, [$userId])
+            ->where(fn ($expiry) => $expiry->whereNull('expires_at')->orWhere('expires_at', '>', now()))
             ->with('sender:id,name,phone,profile_picture_path')
             ->orderByDesc('pinned_at')
             ->get()
@@ -627,6 +641,59 @@ class ConversationController extends Controller
                 'read_at' => \Illuminate\Support\Carbon::parse($cursor->read_at)->toISOString(),
             ])->filter(fn ($cursor) => $cursor['user'] !== null)->values(),
         ]);
+    }
+
+    public function updateDisappearing(Request $request, Conversation $conversation): JsonResponse
+    {
+        $userId = (int) $request->user()->id;
+        if (! $this->userIsParticipant($conversation, $userId)) {
+            return response()->json(['message' => 'Conversation not found.'], 404);
+        }
+        if ($conversation->type !== 'group' &&
+            $this->usersHaveBlock((int) $conversation->low_user_id, (int) $conversation->high_user_id)) {
+            return response()->json(['message' => 'This direct conversation is unavailable.'], 404);
+        }
+
+        $validated = $request->validate([
+            'seconds' => ['required', 'integer', 'in:'.implode(',', self::DISAPPEARING_SECONDS_OPTIONS)],
+        ]);
+        $seconds = (int) $validated['seconds'];
+
+        $conversation->disappearing_seconds = $seconds > 0 ? $seconds : null;
+        $conversation->save();
+
+        Realtime::push($this->participantIds($conversation), 'conversation.changed', [
+            'conversation_id' => $conversation->id,
+        ]);
+
+        return response()->json($this->conversationData($conversation->fresh(), $userId));
+    }
+
+    /** When a new message in this chat should expire, or null if disappearing is off. */
+    private function disappearingExpiry(Conversation $conversation): ?\Illuminate\Support\Carbon
+    {
+        $seconds = (int) ($conversation->disappearing_seconds ?? 0);
+
+        return $seconds > 0 ? now()->addSeconds($seconds) : null;
+    }
+
+    /** Hard-deletes messages whose disappearing timer has passed, with their files. */
+    private function purgeExpired(Conversation $conversation): void
+    {
+        $expired = $conversation->messages()
+            ->whereNotNull('expires_at')
+            ->where('expires_at', '<=', now())
+            ->get(['id', 'attachment_path']);
+        if ($expired->isEmpty()) {
+            return;
+        }
+
+        foreach ($expired as $message) {
+            if ($message->attachment_path) {
+                Storage::disk('private')->delete($message->attachment_path);
+            }
+        }
+        Message::query()->whereKey($expired->pluck('id'))->delete();
     }
 
     public function callHistory(Request $request): JsonResponse
@@ -837,6 +904,7 @@ class ConversationController extends Controller
                     'voice_duration_seconds' => $type === 'voice'
                         ? (int) $validated['voice_duration_seconds']
                         : null,
+                    'expires_at' => $this->disappearingExpiry($conversation),
                 ]);
 
                 if ($file) {
@@ -947,6 +1015,7 @@ class ConversationController extends Controller
                     'attachment_size' => $message->attachment_size,
                     'voice_duration_seconds' => $message->voice_duration_seconds,
                     'is_forwarded' => true,
+                    'expires_at' => $this->disappearingExpiry($targetConversation),
                 ]);
                 $targetConversation->touch();
 
@@ -1254,6 +1323,7 @@ class ConversationController extends Controller
             'friend' => $otherUser ? $this->publicUser($otherUser) : null,
             'last_message' => $lastMessage ? $this->messageData($lastMessage, $userId) : null,
             'unread_count' => $conversation->unread_count ?? 0,
+            'disappearing_seconds' => (int) ($conversation->disappearing_seconds ?? 0),
             'created_at' => $conversation->created_at,
             'updated_at' => $conversation->updated_at,
             // A chat started by someone who is not a friend, until accepted.
@@ -1343,6 +1413,7 @@ class ConversationController extends Controller
             'created_at' => $message->created_at,
             'delivered_at' => $message->delivered_at,
             'read_at' => $message->read_at,
+            'expires_at' => $message->expires_at,
         ];
     }
 
@@ -1367,6 +1438,7 @@ class ConversationController extends Controller
                 [$userId]
             )
             ->whereNull('deleted_for_everyone_at')
+            ->where(fn ($expiry) => $expiry->whereNull('expires_at')->orWhere('expires_at', '>', now()))
             ->whereDoesntHave('hiddenFromUsers', fn ($hiddenQuery) => $hiddenQuery->where('users.id', $userId))
                 ->whereRaw(self::NOT_CLEARED, [$userId]);
     }

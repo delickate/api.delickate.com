@@ -1649,4 +1649,50 @@ class ChatApiTest extends TestCase
             'phone' => '+15559990001', 'password' => 'fresh-password-1',
         ])->assertOk();
     }
+
+    public function test_disappearing_messages_expire_and_are_purged(): void
+    {
+        [$first, $second, $conversation] = $this->makeConversation();
+        $conversation->update(['type' => 'direct']);
+        Sanctum::actingAs($first);
+
+        // Invalid duration is rejected; only the preset options are allowed.
+        $this->patchJson("/api/conversations/{$conversation->id}/disappearing", ['seconds' => 12345])
+            ->assertUnprocessable();
+
+        // Turn on a 24-hour timer.
+        $this->patchJson("/api/conversations/{$conversation->id}/disappearing", ['seconds' => 86400])
+            ->assertOk()
+            ->assertJsonPath('disappearing_seconds', 86400);
+        $this->assertSame(86400, (int) $conversation->fresh()->disappearing_seconds);
+
+        // A new message gets an expiry ~24h out.
+        $messageId = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => 'This will vanish.',
+        ])->assertCreated()->json('id');
+        $this->assertNotNull(Message::query()->whereKey($messageId)->value('expires_at'));
+
+        // Before expiry it is still returned.
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()->assertJsonFragment(['id' => $messageId]);
+
+        // After the timer passes, fetching the chat purges it and it is gone.
+        $this->travel(25)->hours();
+        $this->getJson("/api/conversations/{$conversation->id}/messages")
+            ->assertOk()->assertJsonMissing(['id' => $messageId]);
+        $this->assertDatabaseMissing('messages', ['id' => $messageId]);
+
+        // Turning the timer off clears the setting; new messages never expire.
+        $this->patchJson("/api/conversations/{$conversation->id}/disappearing", ['seconds' => 0])
+            ->assertOk()->assertJsonPath('disappearing_seconds', 0);
+        $keepId = $this->postJson("/api/conversations/{$conversation->id}/messages", [
+            'body' => 'This stays.',
+        ])->assertCreated()->json('id');
+        $this->assertNull(Message::query()->whereKey($keepId)->value('expires_at'));
+
+        // The sweep command also removes anything already past its timer.
+        Message::query()->whereKey($keepId)->update(['expires_at' => now()->subMinute()]);
+        $this->artisan('messages:purge-expired')->assertSuccessful();
+        $this->assertDatabaseMissing('messages', ['id' => $keepId]);
+    }
 }

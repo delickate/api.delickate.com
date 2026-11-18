@@ -18,6 +18,11 @@ class Conversation extends Model
         'created_by_user_id',
         'request_status',
         'requested_by_user_id',
+        'disappearing_seconds',
+    ];
+
+    protected $casts = [
+        'disappearing_seconds' => 'integer',
     ];
 
     public function messages(): HasMany
