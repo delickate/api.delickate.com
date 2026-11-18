@@ -110,6 +110,41 @@ persist delivery/read state; the socket service must relay message and receipt
 events to the other participant. The current REST API does not itself publish
 Socket.IO events.
 
+### API Collections desktop app
+
+Used by the Electron app in `electron/API-Collections`. Every route needs a
+Sanctum token, and users only ever see their own folders and collections
+(other users' IDs return 404).
+
+- `GET /api/workspace` — the whole tree: `folders` (`id`, `parent_id`, `name`,
+  `sort_order`) and `collections` (`id`, `folder_id`, `name`, `description`),
+  without their requests.
+- `POST /api/folders` — `name`, optional `parent_id`. Folders nest to any
+  depth (capped at 50 levels).
+- `PATCH /api/folders/{id}` — rename (`name`) and/or move (`parent_id`, `null`
+  for the top level). A folder cannot be moved into itself or a sub-folder.
+- `DELETE /api/folders/{id}` — deletes the folder with all sub-folders and
+  collections; returns `deleted_folder_ids`.
+- `POST /api/collections` — `name`, optional `folder_id`, `description`,
+  `items`, `variables`, `auth`.
+- `GET /api/collections/{id}` — the collection with its requests.
+- `PATCH /api/collections/{id}` — any of `name`, `description`, `folder_id`
+  (move), `items`, `variables`, `auth`, `sort_order`.
+- `DELETE /api/collections/{id}`, `POST /api/collections/{id}/duplicate`.
+- `GET /api/collections/{id}/export?format=native|postman` — the collection as
+  an API Collections JSON file (default) or a Postman v2.1 collection.
+- `POST /api/collections/import` — `data` (an exported file or a Postman
+  v2.0 / v2.1 collection) and optional `folder_id`. Responds with the new
+  collection and `source` (`native` or `postman`).
+
+A collection's `items` is a tree of request folders
+(`{id, type: "folder", name, items}`) and requests
+(`{id, type: "request", name, method, url, headers, body, auth}`). The server
+normalises everything it stores (unknown fields are dropped, IDs are
+generated) in `app/Support/Collections/CollectionFormat.php`. Postman auth
+other than bearer, basic and API key is imported as "no auth", and form-data
+file fields are imported as empty text fields.
+
 ## Important follow-up
 
 Phone numbers are not verified by SMS yet. Add OTP verification before
