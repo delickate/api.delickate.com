@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Mail\PasswordResetCodeMail;
 use App\Models\DeviceToken;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
@@ -133,14 +134,7 @@ class AuthController extends Controller
             );
 
             try {
-                Mail::raw(
-                    "Your DailyConnect password reset code is: {$code}\n\n"
-                        ."Enter it in the app to set a new password. The code expires in 15 minutes.\n\n"
-                        ."If you did not request this, you can ignore this email; your password stays unchanged.",
-                    function ($message) use ($user) {
-                        $message->to($user->email)->subject('Your DailyConnect password reset code');
-                    }
-                );
+                Mail::to($user->email)->send(new PasswordResetCodeMail($code, 15));
             } catch (\Throwable $exception) {
                 // Never leak mail-delivery failures to the caller; log for the operator.
                 report($exception);
