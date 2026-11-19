@@ -9,6 +9,7 @@ use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\UploadedFile;
 use Laravel\Sanctum\Sanctum;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
 use Tests\TestCase;
 
@@ -1694,6 +1695,49 @@ class ChatApiTest extends TestCase
         Message::query()->whereKey($keepId)->update(['expires_at' => now()->subMinute()]);
         $this->artisan('messages:purge-expired')->assertSuccessful();
         $this->assertDatabaseMissing('messages', ['id' => $keepId]);
+    }
+
+    public function test_device_token_registration_and_push_on_new_message(): void
+    {
+        // A self-contained fake service account so Fcm::enabled() is true. The
+        // key is a committed throwaway used only to sign the (faked) OAuth JWT.
+        $privateKey = file_get_contents(base_path('tests/Fixtures/fcm_test_key.pem'));
+        $credPath = storage_path('app/testing-fcm-service-account.json');
+        file_put_contents($credPath, json_encode([
+            'client_email' => 'push@dailyconnect-49777.iam.gserviceaccount.com',
+            'private_key' => $privateKey,
+            'token_uri' => 'https://oauth2.googleapis.com/token',
+        ]));
+        config(['services.fcm.credentials' => $credPath, 'services.fcm.project_id' => 'dailyconnect-49777']);
+
+        Http::fake([
+            'oauth2.googleapis.com/*' => Http::response(['access_token' => 'ya29.fake', 'expires_in' => 3600]),
+            'fcm.googleapis.com/*' => Http::response(['name' => 'projects/dailyconnect-49777/messages/1']),
+        ]);
+
+        [$first, $second, $conversation] = $this->makeConversation();
+        $conversation->update(['type' => 'direct']);
+
+        // The recipient registers a device; an invalid platform is rejected.
+        Sanctum::actingAs($second);
+        $this->postJson('/api/user/device-tokens', ['token' => 'tok-recipient-123', 'platform' => 'android'])->assertOk();
+        $this->assertDatabaseHas('device_tokens', ['user_id' => $second->id, 'token' => 'tok-recipient-123']);
+        $this->postJson('/api/user/device-tokens', ['token' => 'x', 'platform' => 'nope'])->assertUnprocessable();
+
+        // Sending a message pushes to the recipient's device, not the sender's.
+        Sanctum::actingAs($first);
+        $this->postJson("/api/conversations/{$conversation->id}/messages", ['body' => 'hello'])->assertCreated();
+        \App\Support\Fcm::flush();
+
+        Http::assertSent(fn ($request) => str_contains($request->url(), 'fcm.googleapis.com')
+            && ($request['message']['token'] ?? null) === 'tok-recipient-123');
+
+        // Unregistering removes it.
+        Sanctum::actingAs($second);
+        $this->deleteJson('/api/user/device-tokens', ['token' => 'tok-recipient-123'])->assertOk();
+        $this->assertDatabaseMissing('device_tokens', ['token' => 'tok-recipient-123']);
+
+        @unlink($credPath);
     }
 
     public function test_per_message_disappearing_timer(): void

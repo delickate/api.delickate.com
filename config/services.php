@@ -9,6 +9,15 @@ return [
         'internal_secret' => env('SOCKET_INTERNAL_SECRET'),
     ],
 
+    // Firebase Cloud Messaging (push notifications). FCM_CREDENTIALS is an
+    // ABSOLUTE path to the Firebase *service account* JSON (Project settings →
+    // Service accounts → Generate new private key) — NOT google-services.json,
+    // and it must live OUTSIDE the public/ web root. Leave unset to disable push.
+    'fcm' => [
+        'credentials' => env('FCM_CREDENTIALS'),
+        'project_id' => env('FCM_PROJECT_ID', 'dailyconnect-49777'),
+    ],
+
     /*
     |--------------------------------------------------------------------------
     | Third Party Services

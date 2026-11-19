@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\DeviceToken;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -197,6 +198,37 @@ class AuthController extends Controller
         $user->tokens()->delete();
 
         return response()->json(['message' => 'Your password has been reset. Sign in with your new password.']);
+    }
+
+    public function registerDeviceToken(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'token' => ['required', 'string', 'max:512'],
+            'platform' => ['sometimes', 'string', 'in:android,ios,web,desktop'],
+        ]);
+
+        // A registration token belongs to one app install; if it was previously
+        // tied to another account on this device, move it to the current user.
+        DeviceToken::updateOrCreate(
+            ['token' => $validated['token']],
+            ['user_id' => (int) $request->user()->id, 'platform' => $validated['platform'] ?? 'android'],
+        );
+
+        return response()->json(['message' => 'This device will receive push notifications.']);
+    }
+
+    public function removeDeviceToken(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'token' => ['required', 'string', 'max:512'],
+        ]);
+
+        DeviceToken::query()
+            ->where('user_id', (int) $request->user()->id)
+            ->where('token', $validated['token'])
+            ->delete();
+
+        return response()->json(['message' => 'This device will no longer receive push notifications.']);
     }
 
     public function updateSettings(Request $request): JsonResponse

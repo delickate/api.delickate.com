@@ -8,6 +8,7 @@ use App\Models\FriendRequest;
 use App\Models\Message;
 use App\Models\User;
 use App\Support\ConversationKeys;
+use App\Support\Fcm;
 use App\Support\Realtime;
 use Illuminate\Database\QueryException;
 use Illuminate\Http\JsonResponse;
@@ -1492,16 +1493,57 @@ class ConversationController extends Controller
     /** Sends a message to every member's apps, shaped for each member. */
     private function pushMessage(Conversation $conversation, Message $message, string $event): void
     {
+        $message->loadMissing(['sender:id,name,phone,profile_picture_path', 'replyTo.sender:id,name,profile_picture_path', 'replyTo.hiddenFromUsers']);
+
+        // Push notification to recipients' devices (FCM), independent of the socket.
+        if ($event === 'message.created' && $message->type !== 'call') {
+            $this->pushFcmForMessage($conversation, $message);
+        }
+
         if (! Realtime::enabled()) {
             return;
         }
-        $message->loadMissing(['sender:id,name,phone,profile_picture_path', 'replyTo.sender:id,name,profile_picture_path', 'replyTo.hiddenFromUsers']);
         foreach ($this->participantIds($conversation) as $memberId) {
             Realtime::push([$memberId], $event, [
                 'conversation_id' => $conversation->id,
                 'message' => $this->messageData($message, $memberId),
             ]);
         }
+    }
+
+    /**
+     * Sends a push notification for a new message to every participant except the
+     * sender. Message content is end-to-end encrypted, so the notification stays
+     * generic (no body text); the data payload lets the app open the chat.
+     */
+    private function pushFcmForMessage(Conversation $conversation, Message $message): void
+    {
+        if (! Fcm::enabled()) {
+            return;
+        }
+        $senderId = (int) $message->sender_id;
+        $recipientIds = array_values(array_filter(
+            $this->participantIds($conversation),
+            fn ($id) => (int) $id !== $senderId,
+        ));
+        if ($recipientIds === []) {
+            return;
+        }
+
+        $senderName = $message->sender->name ?? 'Someone';
+        $isGroup = $conversation->type === 'group';
+
+        Fcm::notify(
+            $recipientIds,
+            $isGroup ? ($conversation->name ?: 'Group chat') : $senderName,
+            $isGroup ? "{$senderName} sent a message" : 'Sent you a message',
+            [
+                'conversation_id' => (string) $conversation->id,
+                'message_id' => (string) $message->id,
+                'sender_id' => (string) $senderId,
+                'type' => (string) $message->type,
+            ],
+        );
     }
 
     private function pinnableOrFail(Conversation $conversation, Message $message, int $userId): ?JsonResponse

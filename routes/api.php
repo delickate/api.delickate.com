@@ -47,6 +47,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::delete('/user/profile-picture', [AuthController::class, 'removeProfilePicture']);
     Route::patch('/user/profile', [AuthController::class, 'updateProfile']);
     Route::patch('/user/password', [AuthController::class, 'updatePassword']);
+    Route::post('/user/device-tokens', [AuthController::class, 'registerDeviceToken']);
+    Route::delete('/user/device-tokens', [AuthController::class, 'removeDeviceToken']);
     Route::patch('/user/settings', [AuthController::class, 'updateSettings']);
 
     Route::get('/friends', [FriendController::class, 'index']);
