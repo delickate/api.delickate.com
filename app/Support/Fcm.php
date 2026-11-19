@@ -54,6 +54,36 @@ class Fcm
         }
     }
 
+    /**
+     * Obtains an OAuth2 access token from the configured service account.
+     * Throws on failure — used by `fcm:test` to verify credentials without a device.
+     */
+    public static function fetchAccessToken(): string
+    {
+        return (string) self::accessToken();
+    }
+
+    /** Sends a single push to a raw device token immediately (used by fcm:test). */
+    public static function sendTestToToken(string $token, string $title, string $body): void
+    {
+        if (! self::enabled()) {
+            return;
+        }
+        $accessToken = self::accessToken();
+        if (! $accessToken) {
+            return;
+        }
+        $projectId = (string) config('services.fcm.project_id');
+        self::send(
+            "https://fcm.googleapis.com/v1/projects/{$projectId}/messages:send",
+            $accessToken,
+            $token,
+            $title,
+            $body,
+            ['type' => 'test'],
+        );
+    }
+
     public static function flush(): void
     {
         $queued = self::$queued;
