@@ -13,7 +13,8 @@ use Illuminate\Validation\ValidationException;
  *   folder:  {id, type: "folder", name, items: [...]}
  *   request: {id, type: "request", name, method, url, headers: [kv], body, auth}
  *   kv:      {key, value, enabled}
- *   body:    {mode: none|raw|json|urlencoded|formdata, raw, urlencoded: [kv], formdata: [kv]}
+ *   body:    {mode: none|raw|json|urlencoded|formdata, raw, urlencoded: [kv], formdata: [field]}
+ *   field:   {key, value, enabled, type: text|file, src} (src = local file path, file fields only)
  *   auth:    {type: none|inherit|bearer|basic|apikey, bearer: {token},
  *             basic: {username, password}, apikey: {key, value, in: header|query}}
  */
@@ -133,11 +134,11 @@ class CollectionFormat
             'mode' => $mode,
             'raw' => $this->text($body['raw'] ?? '', 1_000_000),
             'urlencoded' => $this->normalizePairs($body['urlencoded'] ?? []),
-            'formdata' => $this->normalizePairs($body['formdata'] ?? []),
+            'formdata' => $this->normalizePairs($body['formdata'] ?? [], allowFiles: true),
         ];
     }
 
-    private function normalizePairs(mixed $pairs): array
+    private function normalizePairs(mixed $pairs, bool $allowFiles = false): array
     {
         if (! is_array($pairs)) {
             return [];
@@ -150,14 +151,23 @@ class CollectionFormat
             }
             $key = $this->text($pair['key'] ?? '', 500);
             $value = $this->text($pair['value'] ?? '', 10_000);
-            if ($key === '' && $value === '') {
+            $isFile = $allowFiles && ($pair['type'] ?? 'text') === 'file';
+            $src = $isFile ? $this->text($pair['src'] ?? '', 2_000) : '';
+            if ($key === '' && $value === '' && $src === '') {
                 continue;
             }
-            $result[] = [
+            $entry = [
                 'key' => $key,
-                'value' => $value,
+                'value' => $isFile ? '' : $value,
                 'enabled' => ! array_key_exists('enabled', $pair) || (bool) $pair['enabled'],
             ];
+            if ($allowFiles) {
+                $entry['type'] = $isFile ? 'file' : 'text';
+                if ($isFile) {
+                    $entry['src'] = $src;
+                }
+            }
+            $result[] = $entry;
         }
 
         return array_slice($result, 0, 500);
@@ -272,7 +282,9 @@ class CollectionFormat
             'json' => ['mode' => 'raw', 'raw' => $body['raw'], 'options' => ['raw' => ['language' => 'json']]],
             'raw' => ['mode' => 'raw', 'raw' => $body['raw']],
             'urlencoded' => ['mode' => 'urlencoded', 'urlencoded' => $pairs($body['urlencoded'])],
-            'formdata' => ['mode' => 'formdata', 'formdata' => $pairs($body['formdata'])],
+            'formdata' => ['mode' => 'formdata', 'formdata' => array_map(fn ($pair) => ($pair['type'] ?? 'text') === 'file'
+                ? ['key' => $pair['key'], 'type' => 'file', 'src' => $pair['src'] ?? '', 'disabled' => ! $pair['enabled']]
+                : ['key' => $pair['key'], 'value' => $pair['value'], 'type' => 'text', 'disabled' => ! $pair['enabled']], $body['formdata'])],
             default => null,
         };
     }
@@ -436,10 +448,22 @@ class CollectionFormat
 
         $pairs = fn ($list) => array_map(fn ($pair) => [
             'key' => $this->scalar($pair['key'] ?? ''),
-            // File fields cannot travel inside a collection file; keep the key.
             'value' => ($pair['type'] ?? 'text') === 'file' ? '' : $this->scalar($pair['value'] ?? ''),
             'enabled' => empty($pair['disabled']),
         ], array_filter((array) $list, 'is_array'));
+
+        // Postman stores a file field's path in "src" (a string, or an array of paths).
+        $formFields = fn ($list) => array_map(function ($pair) {
+            if (($pair['type'] ?? 'text') !== 'file') {
+                return ['key' => $this->scalar($pair['key'] ?? ''), 'value' => $this->scalar($pair['value'] ?? ''), 'enabled' => empty($pair['disabled']), 'type' => 'text'];
+            }
+            $src = $pair['src'] ?? '';
+            if (is_array($src)) {
+                $src = array_values(array_filter($src, 'is_string'))[0] ?? '';
+            }
+
+            return ['key' => $this->scalar($pair['key'] ?? ''), 'value' => '', 'enabled' => empty($pair['disabled']), 'type' => 'file', 'src' => is_string($src) ? $src : ''];
+        }, array_filter((array) $list, 'is_array'));
 
         switch ($body['mode'] ?? null) {
             case 'raw':
@@ -453,7 +477,7 @@ class CollectionFormat
             case 'urlencoded':
                 return ['mode' => 'urlencoded', 'urlencoded' => $pairs($body['urlencoded'] ?? [])];
             case 'formdata':
-                return ['mode' => 'formdata', 'formdata' => $pairs($body['formdata'] ?? [])];
+                return ['mode' => 'formdata', 'formdata' => $formFields($body['formdata'] ?? [])];
             case 'graphql':
                 $graphql = (array) ($body['graphql'] ?? []);
                 $variables = json_decode((string) ($graphql['variables'] ?? ''), true);

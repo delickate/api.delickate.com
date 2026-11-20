@@ -195,6 +195,51 @@ class ApiCollectionsTest extends TestCase
         $this->assertStringContainsString('pets { id }', $response->json('collection.items.1.body.raw'));
     }
 
+    public function test_form_data_file_fields_round_trip_through_postman(): void
+    {
+        Sanctum::actingAs(User::factory()->create());
+
+        $postman = [
+            'info' => ['name' => 'Uploads', 'schema' => 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json'],
+            'item' => [
+                ['name' => 'Upload avatar', 'request' => [
+                    'method' => 'POST',
+                    'url' => 'https://api.test/avatar',
+                    'body' => ['mode' => 'formdata', 'formdata' => [
+                        ['key' => 'caption', 'value' => 'Me', 'type' => 'text'],
+                        ['key' => 'avatar', 'type' => 'file', 'src' => ['C:\pics\me.png']],
+                        ['key' => 'cv', 'type' => 'file', 'src' => '/home/me/cv.pdf', 'disabled' => true],
+                    ]],
+                ]],
+            ],
+        ];
+
+        $collection = $this->postJson('/api/collections/import', ['data' => $postman])
+            ->assertCreated()
+            ->assertJsonPath('collection.items.0.body.formdata.0.type', 'text')
+            ->assertJsonPath('collection.items.0.body.formdata.0.value', 'Me')
+            ->assertJsonPath('collection.items.0.body.formdata.1.type', 'file')
+            ->assertJsonPath('collection.items.0.body.formdata.1.src', 'C:\pics\me.png')
+            ->assertJsonPath('collection.items.0.body.formdata.2.src', '/home/me/cv.pdf')
+            ->assertJsonPath('collection.items.0.body.formdata.2.enabled', false)
+            ->json('collection');
+
+        $this->getJson("/api/collections/{$collection['id']}/export?format=postman")
+            ->assertOk()
+            ->assertJsonPath('item.0.request.body.formdata.1.type', 'file')
+            ->assertJsonPath('item.0.request.body.formdata.1.src', 'C:\pics\me.png')
+            ->assertJsonPath('item.0.request.body.formdata.2.disabled', true);
+
+        // url-encoded fields never become file fields.
+        $this->patchJson("/api/collections/{$collection['id']}", ['items' => [[
+            'type' => 'request', 'name' => 'Form', 'method' => 'POST', 'url' => 'https://api.test',
+            'body' => ['mode' => 'urlencoded', 'urlencoded' => [['key' => 'a', 'type' => 'file', 'src' => '/etc/passwd']]],
+        ]]])->assertOk()
+            ->assertJsonPath('collection.items.0.body.urlencoded.0.key', 'a')
+            ->assertJsonMissingPath('collection.items.0.body.urlencoded.0.type')
+            ->assertJsonMissingPath('collection.items.0.body.urlencoded.0.src');
+    }
+
     public function test_unknown_import_format_is_rejected(): void
     {
         Sanctum::actingAs(User::factory()->create());
