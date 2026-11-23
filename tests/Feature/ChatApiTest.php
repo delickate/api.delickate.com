@@ -1740,6 +1740,52 @@ class ChatApiTest extends TestCase
         @unlink($credPath);
     }
 
+    public function test_internal_call_notify_pushes_incoming_call(): void
+    {
+        $credPath = storage_path('app/testing-fcm-service-account.json');
+        file_put_contents($credPath, json_encode([
+            'client_email' => 'push@dailyconnect-49777.iam.gserviceaccount.com',
+            'private_key' => file_get_contents(base_path('tests/Fixtures/fcm_test_key.pem')),
+            'token_uri' => 'https://oauth2.googleapis.com/token',
+        ]));
+        config([
+            'services.fcm.credentials' => $credPath,
+            'services.fcm.project_id' => 'dailyconnect-49777',
+            'services.socket.internal_secret' => 'super-secret',
+        ]);
+        Http::fake([
+            'oauth2.googleapis.com/*' => Http::response(['access_token' => 'ya29.fake', 'expires_in' => 3600]),
+            'fcm.googleapis.com/*' => Http::response(['name' => 'ok']),
+        ]);
+
+        $callee = User::factory()->create(['phone' => '+15559990010']);
+        \App\Models\DeviceToken::create(['user_id' => $callee->id, 'token' => 'callee-device', 'platform' => 'android']);
+
+        // No/wrong secret is rejected.
+        $this->postJson('/api/internal/call-notify', ['user_ids' => [$callee->id]])->assertUnauthorized();
+        $this->withHeader('Authorization', 'Bearer wrong')
+            ->postJson('/api/internal/call-notify', ['user_ids' => [$callee->id]])->assertUnauthorized();
+
+        // Correct secret → an incoming-call push is dispatched to the callee's device.
+        $this->withHeader('Authorization', 'Bearer super-secret')
+            ->postJson('/api/internal/call-notify', [
+                'user_ids' => [$callee->id],
+                'caller_name' => 'Alex',
+                'media_type' => 'video',
+                'call_type' => 'direct',
+                'call_id' => 'abc123',
+                'conversation_id' => 5,
+            ])->assertOk()->assertJsonPath('sent', true);
+        \App\Support\Fcm::flush();
+
+        Http::assertSent(fn ($request) => str_contains($request->url(), 'fcm.googleapis.com')
+            && ($request['message']['token'] ?? null) === 'callee-device'
+            && ($request['message']['data']['type'] ?? null) === 'call'
+            && ($request['message']['data']['media_type'] ?? null) === 'video');
+
+        @unlink($credPath);
+    }
+
     public function test_per_message_disappearing_timer(): void
     {
         [$first, $second, $conversation] = $this->makeConversation();

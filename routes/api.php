@@ -5,6 +5,7 @@ use App\Http\Controllers\Api\ApiFolderController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ConversationController;
 use App\Http\Controllers\Api\FriendController;
+use App\Http\Controllers\Api\InternalController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
@@ -30,6 +31,10 @@ Route::get('/', function () {
 
 Route::post('/auth/register', [AuthController::class, 'register'])->middleware('throttle:10,1');
 Route::post('/auth/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
+// Called by the socket server (shared internal secret) to push an incoming-call
+// notification when the callee has no connected device.
+Route::post('/internal/call-notify', [InternalController::class, 'callNotify'])->middleware('throttle:120,1');
+
 Route::post('/auth/forgot-password', [AuthController::class, 'forgotPassword'])->middleware('throttle:5,1');
 Route::post('/auth/reset-password', [AuthController::class, 'resetPassword'])->middleware('throttle:6,1');
 Route::get('/profile-pictures/{user}', [AuthController::class, 'profilePicture'])
